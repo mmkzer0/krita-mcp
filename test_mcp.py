@@ -506,7 +506,13 @@ def main():
             "code": "print('hello from krita')\n"
                     "result = {'docs': len(krita.documents())}"})
         if raw.get("isError"):
-            if "disabled" in _text_of(raw):
+            failure = _text_of(raw)
+            # Only the bridge's own gate reports as "disabled: ..." (the
+            # OpError kind comes first). Anything else must fail loudly --
+            # including the MCP server's "exec_disabled", which means this
+            # harness lost its --enable-exec and is no longer testing the
+            # escape hatch at all.
+            if failure.startswith("disabled:"):
                 skip("run_python and its error-path checks",
                      "(plugin gate closed: launch Krita with "
                      "KRITA_MCP_ALLOW_PYTHON=1 to exercise them)")
@@ -524,7 +530,7 @@ def main():
                 check("non-script actions still work while gated",
                       got.get("triggered") == "edit_undo", str(got)[:160])
             else:
-                raise AssertionError("run_python failed: " + _text_of(raw))
+                raise AssertionError("run_python failed: " + failure)
         else:
             got = json.loads(_text_of(raw))
             check("run_python executed", got.get("ok") is True, str(got)[:300])
