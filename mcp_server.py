@@ -6,6 +6,10 @@ Standard library only: nothing to install, nothing to fail at startup.
 Transport is newline-delimited JSON-RPC 2.0 on stdin/stdout, so stdout is
 reserved exclusively for protocol messages -- all logging goes to stderr.
 
+`run_python`, which executes arbitrary Python inside Krita, is neither
+advertised nor served unless the server is started with `--enable-exec` and the
+plugin allows it as well; see "Arbitrary Python is opt-in" in the README.
+
 Run `python mcp_server.py --selftest` to exercise the bridge from a shell.
 """
 
@@ -292,7 +296,7 @@ DRAW_COMMAND = {
 
 
 def tool(name, description, properties, required=None, op=None, image=False,
-         transform=None):
+         transform=None, exec_required=False):
     return {
         "name": name,
         "description": description,
@@ -305,6 +309,7 @@ def tool(name, description, properties, required=None, op=None, image=False,
         "_op": op or name,
         "_image": image,
         "_transform": transform,
+        "_exec_required": exec_required,
     }
 
 
@@ -543,9 +548,11 @@ TOOLS = [
          "Execute Python inside Krita with the full libkis API, for anything "
          "the other tools do not cover. `Krita`, `krita` (the instance) and "
          "`doc` (the active document) are predefined; assign to `result` to "
-         "return a value. Runs on the UI thread, so keep it quick.",
+         "return a value. Runs on the UI thread, so keep it quick. Disabled "
+         "unless the server was started with --enable-exec and the plugin "
+         "allows it (see the README).",
          {"code": {"type": "string"}},
-         required=["code"]),
+         required=["code"], exec_required=True),
 
     tool("self_test",
          "Verify the bridge end to end: document creation, pixel round-trip, "
@@ -557,8 +564,10 @@ TOOLS = [
 TOOLS_BY_NAME = {t["name"]: t for t in TOOLS}
 
 
-def public_tools():
-    return [{k: v for k, v in t.items() if not k.startswith("_")} for t in TOOLS]
+def public_tools(allow_exec=False):
+    return [{k: v for k, v in t.items() if not k.startswith("_")}
+            for t in TOOLS
+            if allow_exec or not t["_exec_required"]]
 
 
 # ---------------------------------------------------------------------------
@@ -569,12 +578,22 @@ def _summarise(result):
     return json.dumps(result, indent=2, ensure_ascii=False, default=str)
 
 
-def call_tool(name, arguments):
+EXEC_HINT = ("start the MCP server with --enable-exec, and allow it in Krita "
+             "with allow_python=true under [krita_mcp] in kritarc (or "
+             "KRITA_MCP_ALLOW_PYTHON=1 before starting Krita)")
+
+
+def call_tool(name, arguments, allow_exec=False):
     spec = TOOLS_BY_NAME.get(name)
     if spec is None:
         raise BridgeError("unknown_tool",
                           "No tool named {0!r}. Available: {1}".format(
                               name, ", ".join(sorted(TOOLS_BY_NAME))))
+    if spec["_exec_required"] and not allow_exec:
+        raise BridgeError(
+            "exec_disabled",
+            "{0} is not enabled on this MCP server: it runs arbitrary Python "
+            "inside Krita. To use it, {1}.".format(name, EXEC_HINT))
 
     args = dict(arguments or {})
     op = spec["_op"]
@@ -608,9 +627,10 @@ def _error(request_id, code, message, data=None):
 
 
 class Server:
-    def __init__(self):
+    def __init__(self, allow_exec=False):
         self.initialized = False
         self.protocol = PREFERRED_PROTOCOL
+        self.allow_exec = allow_exec
 
     def handle(self, message):
         """Return a response dict, or None for notifications."""
@@ -637,7 +657,7 @@ class Server:
             elif method == "ping":
                 payload = {}
             elif method == "tools/list":
-                payload = {"tools": public_tools()}
+                payload = {"tools": public_tools(self.allow_exec)}
             elif method == "tools/call":
                 payload = self._call(message.get("params") or {})
             elif method in ("resources/list", "resources/templates/list"):
@@ -692,7 +712,7 @@ class Server:
 
         started = time.time()
         try:
-            content = call_tool(name, arguments)
+            content = call_tool(name, arguments, self.allow_exec)
         except BridgeUnavailable as exc:
             return {"content": [{"type": "text", "text": str(exc)}],
                     "isError": True}
@@ -711,7 +731,7 @@ class Server:
         return {"content": content, "isError": False}
 
 
-def serve():
+def serve(allow_exec=False):
     stdin = sys.stdin
     stdout = sys.stdout
     try:  # never let the console codepage mangle protocol bytes
@@ -720,8 +740,9 @@ def serve():
     except AttributeError:
         pass
 
-    server = Server()
-    log("ready (pid {0})".format(os.getpid()))
+    server = Server(allow_exec=allow_exec)
+    log("ready (pid {0}, run_python {1})".format(
+        os.getpid(), "enabled" if allow_exec else "disabled"))
 
     while True:
         try:
@@ -823,17 +844,23 @@ def main():
                              "(avoids shell quoting)")
     parser.add_argument("--list-tools", action="store_true",
                         help="print the MCP tool names and exit")
+    parser.add_argument("--enable-exec", action="store_true",
+                        help="advertise and allow run_python, which executes "
+                             "arbitrary Python inside Krita; the plugin must "
+                             "also allow it (see the README)")
     args = parser.parse_args()
 
     if args.list_tools:
         for spec in TOOLS:
-            print("{0:<20} -> op {1}".format(spec["name"], spec["_op"]))
+            marker = "   [needs --enable-exec]" if spec["_exec_required"] else ""
+            print("{0:<20} -> op {1}{2}".format(spec["name"], spec["_op"],
+                                                marker))
         return 0
     if args.selftest:
         return cli_selftest()
     if args.call:
         return cli_call(args.call, args.params, args.params_file)
-    serve()
+    serve(allow_exec=args.enable_exec)
     return 0
 
 

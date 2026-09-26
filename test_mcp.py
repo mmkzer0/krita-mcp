@@ -29,7 +29,7 @@ PROTOCOL = "2025-06-18"
 
 VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
 
-PASS, FAIL = [], []
+PASS, FAIL, SKIP = [], [], []
 
 
 def check(name, condition, detail=""):
@@ -40,6 +40,12 @@ def check(name, condition, detail=""):
         FAIL.append((name, detail))
         print("  [FAIL] {0}  {1}".format(name, detail))
     return bool(condition)
+
+
+def skip(name, detail=""):
+    """A check the current configuration cannot exercise -- not a pass."""
+    SKIP.append((name, detail))
+    print("  [skip] {0}  {1}".format(name, detail))
 
 
 # Bisection aid: KRITA_MCP_TEST_UNTIL=<section> stops just before that
@@ -61,9 +67,9 @@ def section(title):
 class Client:
     """Minimal MCP client speaking newline-delimited JSON-RPC over pipes."""
 
-    def __init__(self):
+    def __init__(self, args=()):
         self.proc = subprocess.Popen(
-            [sys.executable, SERVER],
+            [sys.executable, SERVER] + list(args),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8", bufsize=1,
         )
@@ -168,7 +174,9 @@ def _image_of(result):
 
 def main():
     tmpdir = tempfile.mkdtemp(prefix="krita-mcp-test-")
-    client = Client()
+    # The escape-hatch checks need the gated tool, so the main client opts in.
+    # The "exec gate" section below proves a default server hides it.
+    client = Client(args=["--enable-exec"])
     doc_name = "mcp integration test"
 
     try:
@@ -217,6 +225,32 @@ def main():
         reply = client.request("ping", {}, timeout=15)
         check("notifications produce no reply and do not desync",
               reply.get("result") == {}, str(reply)[:200])
+
+        # ---------------------------------------------------------------
+        section("exec gate (server side)")
+        check("run_python listed when --enable-exec is on",
+              "run_python" in names, str(sorted(names)))
+
+        plain = Client()
+        try:
+            plain.request("initialize", {"protocolVersion": PROTOCOL,
+                                         "capabilities": {},
+                                         "clientInfo": {"name": "gate-check",
+                                                        "version": "1.0"}},
+                          timeout=30)
+            plain.notify("notifications/initialized")
+            plain_tools = plain.request("tools/list", {}, timeout=15).get(
+                "result", {}).get("tools", [])
+            plain_names = {t["name"] for t in plain_tools}
+            check("run_python hidden without --enable-exec",
+                  "run_python" not in plain_names, str(sorted(plain_names)))
+            refused = plain.call("run_python", {"code": "1 + 1"}, timeout=30)
+            text = _text_of(refused)
+            check("gated call refused before it reaches Krita",
+                  refused.get("isError") is True
+                  and text.startswith("exec_disabled"), text[:200])
+        finally:
+            plain.close()
 
         # ---------------------------------------------------------------
         section("connection and status")
@@ -465,19 +499,47 @@ def main():
 
         # ---------------------------------------------------------------
         section("escape hatches")
-        got, _ = client.ok("run_python", {
+        # The plugin has its own gate (allow_python / KRITA_MCP_ALLOW_PYTHON);
+        # a default Krita refuses this before the checks below can run, so
+        # report that configuration as a skip rather than a failure.
+        raw = client.call("run_python", {
             "code": "print('hello from krita')\n"
                     "result = {'docs': len(krita.documents())}"})
-        check("run_python executed", got.get("ok") is True, str(got)[:300])
-        check("run_python captured stdout",
-              "hello from krita" in got.get("stdout", ""), str(got.get("stdout")))
-        check("run_python returned a value",
-              isinstance(got.get("result", {}).get("docs"), int), str(got))
+        if raw.get("isError"):
+            if "disabled" in _text_of(raw):
+                skip("run_python and its error-path checks",
+                     "(plugin gate closed: launch Krita with "
+                     "KRITA_MCP_ALLOW_PYTHON=1 to exercise them)")
+                # While the gate is closed, the ungated escape hatch must not
+                # be a way around it. Ten Scripts may be absent, in which case
+                # there is nothing to guard.
+                refused = client.call("trigger_action",
+                                      {"name": "execute_script_1"})
+                text = _text_of(refused)
+                check("script-running action refused while gated",
+                      refused.get("isError") is True
+                      and ("runs a Python script" in text
+                           or "no action named" in text), text[:160])
+                got, _ = client.ok("trigger_action", {"name": "edit_undo"})
+                check("non-script actions still work while gated",
+                      got.get("triggered") == "edit_undo", str(got)[:160])
+            else:
+                raise AssertionError("run_python failed: " + _text_of(raw))
+        else:
+            got = json.loads(_text_of(raw))
+            check("run_python executed", got.get("ok") is True, str(got)[:300])
+            check("run_python captured stdout",
+                  "hello from krita" in got.get("stdout", ""),
+                  str(got.get("stdout")))
+            check("run_python returned a value",
+                  isinstance(got.get("result", {}).get("docs"), int), str(got))
 
-        got, _ = client.ok("run_python", {"code": "raise ValueError('boom')"})
-        check("run_python reports errors without killing the bridge",
-              got.get("ok") is False and "boom" in got.get("exception", ""),
-              str(got)[:200])
+            raw = client.call("run_python",
+                              {"code": "raise ValueError('boom')"})
+            got = json.loads(_text_of(raw))
+            check("run_python reports errors without killing the bridge",
+                  got.get("ok") is False and "boom" in got.get("exception", ""),
+                  str(got)[:200])
 
         client.ok("set_selection", {"document": doc_name, "mode": "rect",
                                     "x": 0, "y": 0, "width": 20, "height": 20})
@@ -646,9 +708,12 @@ def main():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
     print("\n" + "=" * 60)
-    print("{0} passed, {1} failed".format(len(PASS), len(FAIL)))
+    print("{0} passed, {1} failed, {2} skipped".format(
+        len(PASS), len(FAIL), len(SKIP)))
     for name, detail in FAIL:
         print("  FAIL {0}: {1}".format(name, detail))
+    for name, detail in SKIP:
+        print("  SKIP {0} {1}".format(name, detail))
     if VERBOSE and client.stderr_lines:
         print("\nserver stderr:")
         for line in client.stderr_lines[-40:]:

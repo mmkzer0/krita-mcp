@@ -10,7 +10,7 @@ from . import ops
 from .httpserver import DEFAULT_PORT, Bridge, info_file_path
 from .mainthread import MainThreadInvoker
 
-SETTINGS_GROUP = "krita_mcp"
+SETTINGS_GROUP = ops.SETTINGS_GROUP
 
 
 def _log(text):
@@ -78,13 +78,16 @@ class KritaMcpExtension(Extension):
             # Everything is looked up through the module rather than bound
             # here, so `importlib.reload(krita_mcp.ops)` from run_python picks
             # up edited operations without restarting Krita.
+            # Snapshot the exec gate on the GUI thread: /health answers on a
+            # worker thread and must not touch libkis.
+            ops.refresh_python_exec_snapshot()
             self._bridge = Bridge(
                 invoker=self._invoker,
                 dispatch=lambda name, params: ops.dispatch(name, params),
                 timeout_for=lambda name: ops.op_timeout(name),
                 plugin_version=ops.PLUGIN_VERSION,
                 krita_version=krita.version(),
-                operations=lambda: list(ops.OPS),
+                operations=lambda: ops.advertised_operations(),
                 logger=_log,
             )
             self._bridge.start(self._read_port())
@@ -121,13 +124,17 @@ class KritaMcpExtension(Extension):
 
     def _on_status(self):
         if self._bridge is not None and self._bridge.running:
+            # GUI thread: re-read the gate before showing it.
+            exec_enabled = ops.refresh_python_exec_snapshot()
             body = (
                 "Running on http://127.0.0.1:{0}\n"
                 "Operations: {1}\n"
-                "Plugin version: {2}\n\n"
-                "Connection details for the MCP server are in:\n{3}"
-            ).format(self._bridge.port, len(ops.OPS), ops.PLUGIN_VERSION,
-                     info_file_path())
+                "Arbitrary Python (run_python): {2}\n"
+                "Plugin version: {3}\n\n"
+                "Connection details for the MCP server are in:\n{4}"
+            ).format(self._bridge.port, len(ops.advertised_operations()),
+                     "enabled" if exec_enabled else "disabled",
+                     ops.PLUGIN_VERSION, info_file_path())
         else:
             body = "Not running."
             if self._start_error:

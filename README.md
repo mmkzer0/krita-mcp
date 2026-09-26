@@ -134,9 +134,42 @@ Restart the client. Krita must be running for the tools to do anything.
 | `apply_filter` | Any Krita filter, whole layer or a region |
 | `set_selection` | rect / all / none / invert / grow / shrink / feather |
 | `list_capabilities` | Filter names and parameters, blending mode ids |
-| `trigger_action` | Fire a Krita menu action by id (`edit_undo`, …) |
-| `run_python` | Arbitrary Python inside Krita, full libkis access |
+| `trigger_action` | Fire a Krita menu action by id (`edit_undo`, …); script-running actions are refused while `run_python` is off (see *Arbitrary Python is opt-in*) |
+| `run_python` | Arbitrary Python inside Krita, full libkis access — **off by default** |
 | `self_test` | End-to-end health check |
+
+### Arbitrary Python is opt-in
+
+`run_python` executes whatever it is handed, with libkis and the whole standard
+library in reach — the same trust level as handing over a shell. It is off in
+two independent places, and both have to be on:
+
+| Where | Switch | Default |
+| --- | --- | --- |
+| MCP server | `python mcp_server.py --enable-exec` | off — the tool is not advertised and calls are refused before anything reaches Krita |
+| Krita plugin | `allow_python=true` under `[krita_mcp]` in `kritarc`, or start Krita with `KRITA_MCP_ALLOW_PYTHON=1` | off — the bridge refuses the operation |
+
+```bash
+# both halves for one session
+KRITA_MCP_ALLOW_PYTHON=1 krita &
+claude mcp add krita -- python /absolute/path/to/mcp_server.py --enable-exec
+```
+
+The environment variable wins over the setting, so exporting
+`KRITA_MCP_ALLOW_PYTHON=0` is a quick way to force the operation off. `/health`
+and *Tools → Scripts → MCP Bridge Status…* both report the current state, and
+the operation list they show leaves `run_python` out while it is off.
+
+While the gate is closed, `trigger_action` additionally refuses the action ids
+that run scripts on a stock Krita (`execute_script_1..10`, `ten_scripts`,
+`python_scripter`) — without that they are a way around the switch. Treat that
+list as a guard, not a sandbox: a plugin you install can register its own
+script runner and the bridge cannot see it.
+
+What the gate is *not*: it does not contain a process that can already read
+`krita_mcp_bridge.json`, and it does not restrict file paths — `open_document`,
+`save_document` and `export_document` still reach anything you can. Connect only
+clients you would let act as you inside Krita.
 
 ### Drawing
 
@@ -221,6 +254,11 @@ make sure the path to `mcp_server.py` is absolute.
 **Port already in use** — the bridge scans upward from 9797 and writes whichever
 port it got into the discovery file, so this normally resolves itself. Set a
 different starting port with `port=` under `[krita_mcp]` in `kritarc`.
+
+**"run_python is disabled"** — that is the default (see *Arbitrary Python is
+opt-in*). A model seeing this wants both switches: `--enable-exec` on the MCP
+server and `allow_python=true` in `kritarc` (or `KRITA_MCP_ALLOW_PYTHON=1`
+before Krita starts).
 
 **Something crashed and you want to know why** — set `KRITA_MCP_TRACE=1` before
 starting Krita to log every operation to `krita_mcp_trace.log` in Krita's data

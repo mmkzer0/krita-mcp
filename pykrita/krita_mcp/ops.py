@@ -46,6 +46,17 @@ from .imaging import ImagingError, parse_color
 
 PLUGIN_VERSION = "1.0.0"
 
+# Owned here; extension.py imports it so the gate and the settings reader
+# cannot drift apart (Krita reads [krita_mcp] from kritarc).
+SETTINGS_GROUP = "krita_mcp"
+
+# Environment override for that gate, for pipelines and tests that cannot edit
+# kritarc. Setting it to a false value forces the operation off.
+PYTHON_EXEC_ENV = "KRITA_MCP_ALLOW_PYTHON"
+
+# Operations that are hidden and refused unless the operator opts in.
+GATED_OPS = ("run_python",)
+
 OPS = {}
 
 # Krita 5.3 exposes no way to enumerate composite ops, and setBlendingMode
@@ -95,6 +106,72 @@ def op(name, timeout=20.0, mutates=False):
 def _krita():
     from krita import Krita
     return Krita.instance()
+
+
+def _setting_truthy(raw):
+    return str(raw).strip().lower() in ("true", "1", "yes", "on")
+
+
+def python_exec_enabled():
+    """Is the arbitrary-Python operation allowed on this bridge?
+
+    Opt-in on purpose: `run_python` executes whatever it is handed, with
+    libkis and the whole standard library in reach. Reads the environment
+    first (pipelines, tests, headless runs), then Krita's own setting.
+    Anything unreadable is treated as disabled.
+
+    GUI THREAD ONLY: reading a Krita setting goes through libkis like any
+    other Krita call. The worker threads that answer /health must use
+    advertised_operations() instead.
+    """
+    override = os.environ.get(PYTHON_EXEC_ENV)
+    if override is not None:
+        return _setting_truthy(override)
+    try:
+        raw = _krita().readSetting(SETTINGS_GROUP, "allow_python", "false")
+    except Exception:
+        return False
+    return _setting_truthy(raw)
+
+
+# Last gate value observed on the GUI thread. /health answers on a worker
+# thread, where touching libkis is forbidden, so it reads this snapshot instead
+# of the setting itself. None means "not looked at yet", which reads as
+# disabled: a bridge that never started has nothing to advertise.
+_EXEC_SNAPSHOT = {"enabled": None}
+
+
+def refresh_python_exec_snapshot():
+    """Re-read the gate on the GUI thread and cache it. Returns the value."""
+    _EXEC_SNAPSHOT["enabled"] = python_exec_enabled()
+    return _EXEC_SNAPSHOT["enabled"]
+
+
+def advertised_operations():
+    """Operation names the bridge reports to clients (worker-thread safe).
+
+    Gated operations stay out of the advertised list while they are disabled,
+    so a client that reads /health sees the surface it can actually use. The
+    value can trail the live gate by one operation; the gate itself is always
+    re-checked when a gated operation is called.
+    """
+    if _EXEC_SNAPSHOT["enabled"]:
+        return list(OPS)
+    return [name for name in OPS if name not in GATED_OPS]
+
+
+# Action ids that run code. Krita publishes no "this action executes Python"
+# metadata, so this is a denylist of the runners shipped with stock Krita:
+# Ten Scripts executes a configured .py path (`execute_script_1..10`), the
+# Scripter action opens the script editor, and any plugin a user installs can
+# add its own runners that nothing here can see. A guard, not a sandbox.
+SCRIPT_ACTIONS = ("ten_scripts", "python_scripter")
+SCRIPT_ACTION_PREFIXES = ("execute_script_",)
+
+
+def runs_code(action_name):
+    return (action_name in SCRIPT_ACTIONS
+            or action_name.startswith(SCRIPT_ACTION_PREFIXES))
 
 
 def _arg(params, key, default=None):
@@ -1673,6 +1750,12 @@ def op_set_selection(params):
 @op("trigger_action", timeout=60.0, mutates=True)
 def op_trigger_action(params):
     name = str(_req(params, "name"))
+    if not python_exec_enabled() and runs_code(name):
+        raise OpError(
+            "Krita's {0!r} action runs a Python script, so triggering it is "
+            "refused while run_python is disabled: see the README section "
+            "\"Arbitrary Python is opt-in\" for the two switches that enable "
+            "both.".format(name), kind="disabled")
     action = _krita().action(name)
     if action is None:
         raise OpError(
@@ -1703,6 +1786,17 @@ def op_trigger_action(params):
 
 @op("run_python", timeout=120.0, mutates=True)
 def op_run_python(params):
+    if not python_exec_enabled():
+        raise OpError(
+            "run_python is disabled. It executes arbitrary Python inside "
+            "Krita, so it is opt-in in two places:\n"
+            "  - Krita: allow_python=true under [krita_mcp] in kritarc, or "
+            "start Krita with {0}=1\n"
+            "  - the MCP server: --enable-exec\n"
+            "See the README section \"Arbitrary Python is opt-in\".".format(
+                PYTHON_EXEC_ENV),
+            kind="disabled")
+
     code = _req(params, "code")
     if not isinstance(code, str) or not code.strip():
         raise OpError("code must be a non-empty Python source string")
@@ -1851,6 +1945,9 @@ _batch_saved = False
 
 def dispatch(name, params):
     """Look up and run an operation. Called on the GUI thread."""
+    # GUI thread: safe (and cheap) to re-read the gate so a long-lived bridge
+    # follows setting changes, and so /health's snapshot is never stale.
+    refresh_python_exec_snapshot()
     handler = OPS.get(name)
     if handler is None:
         raise OpError(
