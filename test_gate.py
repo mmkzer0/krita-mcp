@@ -20,7 +20,9 @@ proves the script-action guard is actually consulted, and that a default
 install hides and refuses run_python end to end.
 """
 
+import json
 import os
+import subprocess
 import sys
 import threading
 import unittest
@@ -241,6 +243,126 @@ class HarnessPredicateTest(unittest.TestCase):
     def test_other_failures_do_not_skip(self):
         self.assertFalse(test_mcp.is_plugin_gated(
             "Could not reach the Krita MCP bridge."))
+
+
+class GateResilienceTest(unittest.TestCase):
+    """S1: a gate that cannot refresh must close, not break the bridge.
+
+    The Gate refuses to refresh off the thread that owns Krita, which is what
+    keeps libkis off the /health worker threads. That refusal used to escape
+    into ops.dispatch(), where every operation turned into HTTP 500.
+    """
+
+    def _policy(self, instance):
+        policy = getattr(instance, "refresh_or_closed", None)
+        self.assertIsNotNone(policy, "Gate.refresh_or_closed is missing")
+        return policy
+
+    @unittest.expectedFailure
+    def test_foreign_thread_reports_closed_instead_of_raising(self):
+        instance = gate.Gate(read_setting=lambda: gate.UNSET)
+        policy = self._policy(instance)
+        instance.refresh()  # owned by this thread
+        logs, outcome = [], []
+
+        def worker():
+            outcome.append(policy(log=logs.append))
+
+        thread = threading.Thread(target=worker, name="foreign-thread")
+        thread.start()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcome, [False],
+                         "the adapter must report the gate closed")
+        self.assertTrue(logs, "the refusal must be logged, not silently eaten")
+
+    @unittest.expectedFailure
+    def test_owner_thread_still_reports_the_live_value(self):
+        instance = gate.Gate(read_setting=lambda: gate.UNSET)
+        policy = self._policy(instance)
+        with mock.patch.dict(os.environ, {gate.ENV_VAR: "1"}):
+            self.assertTrue(policy())
+            self.assertTrue(instance.enabled)
+
+
+class GateFreshnessTest(unittest.TestCase):
+    """S2: the environment override must apply before any refresh.
+
+    A module reload builds a fresh Gate, and /health reads it from a worker
+    thread before the next operation has refreshed it.
+    """
+
+    @unittest.expectedFailure
+    def test_environment_applies_before_any_refresh(self):
+        instance = gate.Gate(read_setting=lambda: gate.UNSET)  # never refreshed
+        with mock.patch.dict(os.environ, {gate.ENV_VAR: "1"}):
+            self.assertTrue(instance.enabled)
+            self.assertIn("run_python",
+                          instance.advertised(("status", "run_python")))
+
+    def test_cached_setting_decides_when_the_environment_is_silent(self):
+        instance = gate.Gate(read_setting=lambda: "true")
+        with mock.patch.dict(os.environ):
+            os.environ.pop(gate.ENV_VAR, None)
+            instance.refresh()
+            self.assertIn("run_python",
+                          instance.advertised(("status", "run_python")))
+
+    def test_environment_deny_applies_before_any_refresh(self):
+        instance = gate.Gate(read_setting=lambda: "true")
+        with mock.patch.dict(os.environ, {gate.ENV_VAR: "0"}):
+            self.assertFalse(instance.enabled)
+
+
+class GateSourceTest(unittest.TestCase):
+    """S3: the operator must see why the gate is open, not just that it is."""
+
+    @unittest.expectedFailure
+    def test_summary_names_the_source(self):
+        summary = getattr(gate, "summary", None)
+        self.assertIsNotNone(summary, "gate.summary is missing")
+        self.assertEqual(summary(True, "env"), "enabled (environment)")
+        self.assertEqual(summary(True, "setting"), "enabled (kritarc)")
+        self.assertEqual(summary(True, "default"), "enabled")
+        self.assertEqual(summary(False, "setting"), "disabled")
+
+    def test_source_follows_the_deciding_switch(self):
+        instance = gate.Gate(read_setting=lambda: "true")
+        with mock.patch.dict(os.environ, {gate.ENV_VAR: "0"}):
+            instance.refresh()
+            self.assertFalse(instance.enabled)
+            self.assertEqual(instance.source, "env")
+
+
+class ImportHygieneTest(unittest.TestCase):
+    """S5: importing this module must not disturb the interpreter.
+
+    The module loads the plugin's policy file, the MCP server and the live
+    harness. Doing that by inserting directories into sys.path and importing
+    bare names leaks both into every other test in the same process.
+    """
+
+    @unittest.expectedFailure
+    def test_import_leaves_sys_path_and_module_names_alone(self):
+        probe = (
+            "import importlib.util, json, sys\n"
+            "before = list(sys.path)\n"
+            "spec = importlib.util.spec_from_file_location('tg_probe', {path!r})\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(module)\n"
+            "print(json.dumps({{'added': [p for p in sys.path if p not in before],\n"
+            "                   'bare': [n for n in ('gate', 'mcp_server', 'test_mcp')\n"
+            "                           if n in sys.modules]}}))\n"
+        ).format(path=str(HERE / "test_gate.py"))
+        result = subprocess.run([sys.executable, "-c", probe],
+                                capture_output=True, text=True, cwd=str(HERE),
+                                timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr[-400:])
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(payload["added"], [],
+                         "the module must not grow sys.path")
+        self.assertEqual(payload["bare"], [],
+                         "the module must not register bare module names")
 
 
 if __name__ == "__main__":

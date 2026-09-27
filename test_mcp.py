@@ -684,6 +684,10 @@ def exec_gate_section(client, names):
         check("gated call refused before it reaches Krita",
               refused.get("isError") is True
               and text.startswith("exec_disabled"), text[:200])
+        # The two halves keep their own wording, so pin the contract the text
+        # has to satisfy rather than the wording itself.
+        check("server refusal names both switches",
+              "--enable-exec" in text and "allow_python" in text, text[:200])
     finally:
         plain.close()
 
@@ -706,6 +710,9 @@ def escape_hatch_section(client, doc_name):
             skip("run_python and its error-path checks",
                  "(plugin gate closed: launch Krita with "
                  "KRITA_MCP_ALLOW_PYTHON=1 to exercise them)")
+            check("plugin refusal names both switches",
+                  "--enable-exec" in failure and "allow_python" in failure,
+                  failure[:200])
             # While the gate is closed, the ungated escape hatch must not be a
             # way around it. Ten Scripts may be absent, in which case there is
             # nothing to guard.
