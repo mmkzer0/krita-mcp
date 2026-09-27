@@ -20,7 +20,9 @@ ENV_VAR = "KRITA_MCP_ALLOW_PYTHON"
 
 # readSetting() returns the default it is handed when the key is absent, which
 # is how the gate tells "explicitly off" from "never configured". No KConfig
-# value can contain a NUL, so this cannot collide with a real setting.
+# value can contain a NUL, so this cannot collide with a real setting. Compare
+# it by value, never by identity: Krita hands the default back as a fresh
+# string object, so `is` would read a missing key as an explicit deny.
 UNSET = "\x00unset"
 
 # Operations that stay hidden and refused until the operator opts in.
@@ -51,13 +53,24 @@ def runs_code(action_name):
 def decision(setting_value, env_value):
     """Resolve the two switches into (enabled, source of truth).
 
-    The environment variable wins whenever it is present; otherwise the
-    setting decides; with neither configured the operation stays off.
+    An explicit "off" anywhere wins. That ordering matters: a stale
+    ``KRITA_MCP_ALLOW_PYTHON=1`` exported in a shell profile must not override
+    ``allow_python=false`` in kritarc, and ``KRITA_MCP_ALLOW_PYTHON=0`` must
+    still force one session off. Enabling takes an explicit "on" from one of
+    the two, with the setting deciding when both allow, and UNSET meaning the
+    key was never configured rather than that it is off.
     """
-    if env_value is not None:
-        return truthy(env_value), "env"
-    if setting_value is not UNSET:
-        return truthy(setting_value), "setting"
+    setting_configured = setting_value != UNSET
+    env_configured = env_value is not None
+
+    if setting_configured and not truthy(setting_value):
+        return False, "setting"
+    if env_configured and not truthy(env_value):
+        return False, "env"
+    if setting_configured:
+        return True, "setting"
+    if env_configured:
+        return True, "env"
     return False, "default"
 
 

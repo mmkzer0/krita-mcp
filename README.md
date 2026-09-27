@@ -155,10 +155,12 @@ KRITA_MCP_ALLOW_PYTHON=1 krita &
 claude mcp add krita -- python /absolute/path/to/mcp_server.py --enable-exec
 ```
 
-The environment variable wins over the setting, so exporting
-`KRITA_MCP_ALLOW_PYTHON=0` is a quick way to force the operation off. `/health`
-and *Tools → Scripts → MCP Bridge Status…* both report the current state, and
-the operation list they show leaves `run_python` out while it is off.
+An explicit "off" in either place wins: `allow_python=false` in `kritarc` cannot
+be overridden by an environment variable left over in a shell profile, and
+`KRITA_MCP_ALLOW_PYTHON=0` still forces one session off. Enabling takes an
+explicit "on" in one of the two. `/health` leaves the operation out of the list
+it reports while it is off, and *Tools → Scripts → MCP Bridge Status…* names the
+state outright.
 
 While the gate is closed, `trigger_action` additionally refuses the action ids
 that run scripts on a stock Krita (`execute_script_1..10`, `ten_scripts`,

@@ -53,6 +53,26 @@ class GatePolicyTest(unittest.TestCase):
     def test_setting_false_disables(self):
         self.assertEqual(gate.decision("false", None), (False, "setting"))
 
+    def test_explicit_deny_beats_an_enabling_environment(self):
+        # A stale KRITA_MCP_ALLOW_PYTHON=1 must not override an explicit
+        # allow_python=false in kritarc.
+        self.assertEqual(gate.decision("false", "1"), (False, "setting"))
+
+    def test_environment_can_force_the_gate_off(self):
+        self.assertEqual(gate.decision("true", "0"), (False, "env"))
+
+    def test_setting_wins_when_both_switches_allow(self):
+        self.assertEqual(gate.decision("true", "1"), (True, "setting"))
+
+    def test_absent_setting_survives_a_krita_round_trip(self):
+        # Krita hands the default back as a fresh string object, so "absent"
+        # has to be recognised by value. An identity comparison here reads a
+        # missing key as an explicit deny and closes the gate on every launch.
+        round_tripped = "".join(["\x00", "unset"])
+        self.assertIsNot(round_tripped, gate.UNSET)
+        self.assertEqual(gate.decision(round_tripped, "1"), (True, "env"))
+        self.assertEqual(gate.decision(round_tripped, None), (False, "default"))
+
     def test_unrecognised_values_read_as_off(self):
         for raw in ("", "maybe", "2", "no"):
             with self.subTest(raw=raw):
