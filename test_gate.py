@@ -258,7 +258,6 @@ class GateResilienceTest(unittest.TestCase):
         self.assertIsNotNone(policy, "Gate.refresh_or_closed is missing")
         return policy
 
-    @unittest.expectedFailure
     def test_foreign_thread_reports_closed_instead_of_raising(self):
         instance = gate.Gate(read_setting=lambda: gate.UNSET)
         policy = self._policy(instance)
@@ -276,7 +275,6 @@ class GateResilienceTest(unittest.TestCase):
                          "the adapter must report the gate closed")
         self.assertTrue(logs, "the refusal must be logged, not silently eaten")
 
-    @unittest.expectedFailure
     def test_owner_thread_still_reports_the_live_value(self):
         instance = gate.Gate(read_setting=lambda: gate.UNSET)
         policy = self._policy(instance)

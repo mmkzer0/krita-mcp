@@ -102,6 +102,12 @@ def _krita():
     return Krita.instance()
 
 
+def _log(text):
+    # The plugin logs through print(): it lands in the terminal Krita was
+    # started from, or in Tools > Scripts > Scripter output.
+    print("[krita-mcp] " + text)
+
+
 def _read_allow_python():
     """Read [krita_mcp] allow_python through libkis. GUI thread only.
 
@@ -122,12 +128,14 @@ def python_exec_enabled():
 
     A live check with no caching: run_python executes whatever it is handed,
     with libkis and the whole standard library in reach, so the answer has to
-    come from the settings as they are right now.
+    come from the settings as they are right now. If the gate cannot be read
+    from this thread the adapter reports it closed and logs why, so the rest of
+    the bridge keeps working.
 
     GUI THREAD ONLY. The worker threads that answer /health must use
     advertised_operations() instead.
     """
-    return _GATE.refresh()
+    return _GATE.refresh_or_closed(log=_log)
 
 
 def advertised_operations():

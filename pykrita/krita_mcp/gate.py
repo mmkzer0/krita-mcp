@@ -105,6 +105,23 @@ class Gate:
             self._read_setting(), os.environ.get(ENV_VAR))
         return self._enabled
 
+    def refresh_or_closed(self, log=None):
+        """Refresh, or report the gate closed when this thread may not.
+
+        The owner-thread rule keeps libkis off the worker threads, but the
+        refusal must not travel further than the gate. Callers use this
+        adapter so a bridge keeps serving its other operations with run_python
+        closed and one log line explaining why, instead of answering every
+        operation with an error.
+        """
+        try:
+            return self.refresh()
+        except Exception as exc:  # the owner-thread refusal, or a reader bug
+            if log is not None:
+                log("gate refresh failed on this thread, treating run_python "
+                    "as disabled: {0}".format(exc))
+            return False
+
     def advertised(self, names):
         """The operation names clients may see. Safe on any thread."""
         if self._enabled:
