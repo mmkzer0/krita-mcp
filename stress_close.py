@@ -14,11 +14,15 @@ Krita, so they need the plugin's allow_python opt-in ("Arbitrary Python is
 opt-in" in the README); the harness refuses to start them while the gate is
 closed instead of tripping over it mid-run.
 
-``STRESS_GROUPS`` (default ``restack,errors,reads``) selects the optional work
-inside an iteration; ``python`` adds the two run_python probes and needs the
-same opt-in. ``STRESS_VIEW=0`` asks for view-less documents and verifies the
-bridge honoured that. ``STRESS_ALLOW_OPEN_DOCS=1`` overrides the refusal to
-soak while Krita holds other documents.
+``STRESS_GROUPS`` (default ``geometry,restack,errors,reads``) selects the work
+inside an iteration: ``geometry`` runs the canvas crop/scale/rotate/flatten
+sequence, ``restack`` the layer surgery, ``reads`` the image and pixel reads,
+and ``python`` the two run_python probes (which need the same opt-in). Leaving
+``geometry`` out still builds, edits, saves, exports and closes a document
+every iteration, which is what isolates the close path from the canvas path.
+``STRESS_VIEW=0`` asks for view-less documents and verifies the bridge honoured
+that. ``STRESS_ALLOW_OPEN_DOCS=1`` overrides the refusal to soak while Krita
+holds other documents.
 
 The last line of output is ``RESULT`` plus a JSON summary: per-iteration
 outcomes, new crash reports and the operation the trace log left unfinished.
@@ -39,7 +43,7 @@ NAME = "stress doc"
 TRACE_FILE = "krita_mcp_trace.log"
 DEFAULT_STRATEGY = "op"
 DEFAULT_ITERATIONS = 8
-DEFAULT_GROUPS = ("restack", "errors", "reads")
+DEFAULT_GROUPS = ("geometry", "restack", "errors", "reads")
 KNOWN_GROUPS = DEFAULT_GROUPS + ("python",)
 CRASH_SETTLE_S = 20.0
 
@@ -295,6 +299,22 @@ def _verify_view(doc_name, want_view):
             "attached.".format(doc_name, views))
 
 
+def _geometry(name):
+    """The canvas geometry a suite-like iteration runs on a document.
+
+    Its own group because these are the operations that destabilise a document
+    that is on a canvas (see the README's crash note). A run without them still
+    edits, saves, exports and closes one document per iteration, so a death
+    there is not the canvas path's doing.
+    """
+    call("crop_image", {"document": name, "x": 0, "y": 0,
+                        "width": 220, "height": 160}, timeout=60)
+    call("scale_image", {"document": name, "width": 150,
+                         "height": 110}, timeout=90)
+    call("rotate_image", {"document": name, "degrees": 90}, timeout=60)
+    call("flatten_image", {"document": name}, timeout=60)
+
+
 def _restack(name):
     """The layer surgery the integration suite performs."""
     call("duplicate_layer", {"document": name, "layer": "Art",
@@ -405,13 +425,8 @@ def _build(tmpdir, index, groups, view):
     call("set_selection", {"document": NAME, "mode": "rect", "x": 5,
                            "y": 5, "width": 40, "height": 40})
     call("set_selection", {"document": NAME, "mode": "none"})
-    call("crop_image", {"document": NAME, "x": 0, "y": 0,
-                        "width": 220, "height": 160}, timeout=60)
-    call("scale_image", {"document": NAME, "width": 150,
-                         "height": 110}, timeout=90)
-    call("rotate_image", {"document": NAME, "degrees": 90},
-         timeout=60)
-    call("flatten_image", {"document": NAME}, timeout=60)
+    if "geometry" in groups:
+        _geometry(NAME)
     _roundtrip(tmpdir, index, view)
     if "errors" in groups:
         _errors(NAME)

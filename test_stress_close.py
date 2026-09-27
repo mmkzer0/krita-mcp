@@ -137,5 +137,68 @@ class CommandLineTest(unittest.TestCase):
                 os.environ["STRESS_GROUPS"] = previous
 
 
+class WorkloadGroupTest(unittest.TestCase):
+    """_build: the geometry group is what a close-only run leaves out.
+
+    A run without geometry still has to reach close with a fully edited
+    document, so the assertions cover both directions: the four geometry
+    operations disappear, and the editing/saving work stays.
+    """
+
+    def setUp(self):
+        self.ops = []
+        self._real_call = stress_close.call
+        self._totals = dict(stress_close.TOTALS)
+        stress_close.call = self._record
+        self.addCleanup(self._restore)
+
+    def _record(self, op, params=None, timeout=None):
+        self.ops.append(op)
+        # _roundtrip resolves the reopened document from what open_document
+        # returned, so the stand-in has to look like a document summary.
+        return {"name": stress_close.NAME, "file_name": "/tmp/stress.png"}
+
+    def _restore(self):
+        stress_close.call = self._real_call
+        stress_close.TOTALS.update(self._totals)
+
+    def _build(self, groups):
+        stress_close._build(tempfile.mkdtemp(prefix="krita-groups-"), 1,
+                            groups, True)
+
+    def test_default_groups_run_the_geometry_sequence(self):
+        self._build(stress_close.DEFAULT_GROUPS)
+        for op in ("crop_image", "scale_image", "rotate_image",
+                   "flatten_image"):
+            with self.subTest(op=op):
+                self.assertIn(op, self.ops)
+
+    def test_a_run_without_geometry_still_edits_saves_and_reopens(self):
+        groups = tuple(name for name in stress_close.DEFAULT_GROUPS
+                       if name != "geometry")
+        self._build(groups)
+        for op in ("crop_image", "scale_image", "rotate_image",
+                   "flatten_image"):
+            with self.subTest(op=op):
+                self.assertNotIn(op, self.ops)
+        for op in ("create_document", "draw", "apply_filter",
+                   "export_document", "save_document", "open_document",
+                   "set_layer"):
+            with self.subTest(op=op):
+                self.assertIn(op, self.ops)
+
+    def test_geometry_is_the_only_difference(self):
+        with_geometry = (stress_close.DEFAULT_GROUPS,)
+        self._build(with_geometry[0])
+        full = list(self.ops)
+        self.ops = []
+        self._build(tuple(name for name in stress_close.DEFAULT_GROUPS
+                          if name != "geometry"))
+        self.assertEqual(
+            [op for op in full if op not in ("crop_image", "scale_image",
+                                             "rotate_image", "flatten_image")],
+            self.ops)
+
+
 if __name__ == "__main__":
     unittest.main()
