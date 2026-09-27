@@ -142,9 +142,10 @@ def advertised_operations():
     """Operation names the bridge reports to clients (worker-thread safe).
 
     Gated operations stay out of the list while they are disabled, so a client
-    reading /health sees the surface it can actually use. The value can trail
-    the live gate by one operation; the gate itself is always re-checked when a
-    gated operation is called.
+    reading /health sees the surface it can actually use. The environment half
+    of the decision is read per call; only the kritarc value follows the last
+    refresh, which bridge start and every operation perform. The gate itself is
+    always re-checked when a gated operation is called.
     """
     return _GATE.advertised(OPS)
 

@@ -87,23 +87,34 @@ class Gate:
     def __init__(self, read_setting):
         self._read_setting = read_setting
         self._owner = threading.current_thread()
-        self._enabled = False
-        self._source = "default"
+        self._setting = UNSET  # what the last refresh read from Krita
+        self._unavailable = False
+
+    def state(self):
+        """(enabled, source) without touching Krita. Safe on any thread.
+
+        The environment half is evaluated on every call, so an export applies
+        immediately, including in the window after a module reload and before
+        the next operation. Only the kritarc value comes from the cache.
+        """
+        if self._unavailable:
+            return False, "unavailable"
+        return decision(self._setting, os.environ.get(ENV_VAR))
 
     @property
     def enabled(self):
-        return self._enabled
+        return self.state()[0]
 
     @property
     def source(self):
-        return self._source
+        return self.state()[1]
 
     def refresh(self):
-        """Re-read both switches and return the decision. Owner thread only."""
+        """Re-read the setting and return the decision. Owner thread only."""
         self.assert_owner_thread()
-        self._enabled, self._source = decision(
-            self._read_setting(), os.environ.get(ENV_VAR))
-        return self._enabled
+        self._setting = self._read_setting()
+        self._unavailable = False
+        return self.state()[0]
 
     def refresh_or_closed(self, log=None):
         """Refresh, or report the gate closed when this thread may not.
@@ -113,18 +124,28 @@ class Gate:
         adapter so a bridge keeps serving its other operations with run_python
         closed and one log line explaining why, instead of answering every
         operation with an error.
+
+        A refusal also marks the gate unavailable until the next successful
+        refresh, so the advertised list cannot outlive a refusal that already
+        happened.
         """
         try:
             return self.refresh()
         except Exception as exc:  # the owner-thread refusal, or a reader bug
+            self._unavailable = True
             if log is not None:
                 log("gate refresh failed on this thread, treating run_python "
                     "as disabled: {0}".format(exc))
             return False
 
     def advertised(self, names):
-        """The operation names clients may see. Safe on any thread."""
-        if self._enabled:
+        """The operation names clients may see. Safe on any thread.
+
+        Only the kritarc half can trail here: it follows the last refresh,
+        which bridge start and every operation perform. The environment is
+        read on each call.
+        """
+        if self.state()[0]:
             return list(names)
         return [name for name in names if name not in GATED_OPERATIONS]
 

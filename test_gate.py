@@ -155,9 +155,11 @@ class GateThreadingTest(unittest.TestCase):
                          ["status"])
 
     def test_advertised_lists_everything_while_enabled(self):
+        # The environment is read on every call, so the assertion belongs
+        # inside the patch: the setting half is what the cache holds.
         with mock.patch.dict(os.environ, {gate.ENV_VAR: "1"}):
             self.gate.refresh()
-        names = self.gate.advertised(("status", "run_python"))
+            names = self.gate.advertised(("status", "run_python"))
         self.assertEqual(names, ["status", "run_python"])
 
     def test_advertised_never_touches_the_settings_reader(self):
@@ -290,13 +292,27 @@ class GateFreshnessTest(unittest.TestCase):
     thread before the next operation has refreshed it.
     """
 
-    @unittest.expectedFailure
     def test_environment_applies_before_any_refresh(self):
         instance = gate.Gate(read_setting=lambda: gate.UNSET)  # never refreshed
         with mock.patch.dict(os.environ, {gate.ENV_VAR: "1"}):
             self.assertTrue(instance.enabled)
             self.assertIn("run_python",
                           instance.advertised(("status", "run_python")))
+
+    def test_a_refused_refresh_never_advertises_the_gated_operation(self):
+        instance = gate.Gate(read_setting=lambda: gate.UNSET)
+        outcome = []
+        thread = threading.Thread(
+            target=lambda: outcome.append(instance.refresh_or_closed()))
+        thread.start()
+        thread.join(timeout=5)
+        self.assertEqual(outcome, [False], "the foreign thread must be refused")
+        with mock.patch.dict(os.environ, {gate.ENV_VAR: "1"}):
+            self.assertFalse(instance.enabled,
+                             "a gate that cannot refresh reports closed")
+            self.assertEqual(instance.source, "unavailable")
+            self.assertNotIn("run_python",
+                             instance.advertised(("status", "run_python")))
 
     def test_cached_setting_decides_when_the_environment_is_silent(self):
         instance = gate.Gate(read_setting=lambda: "true")
