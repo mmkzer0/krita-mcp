@@ -165,6 +165,17 @@ def _text_of(result):
     return ""
 
 
+def is_plugin_gated(failure_text):
+    """Did Krita's own gate refuse the call, rather than the MCP server?
+
+    Only the plugin reports "disabled: ..." (its OpError kind comes first), and
+    that is what lets the suite skip the escape-hatch checks on a default
+    install. The server refuses with "exec_disabled: ...": treating that as a
+    skip would hide a harness that lost its own --enable-exec.
+    """
+    return failure_text.startswith("disabled:")
+
+
 def _image_of(result):
     for block in result.get("content", []):
         if block.get("type") == "image":
@@ -507,12 +518,7 @@ def main():
                     "result = {'docs': len(krita.documents())}"})
         if raw.get("isError"):
             failure = _text_of(raw)
-            # Only the bridge's own gate reports as "disabled: ..." (the
-            # OpError kind comes first). Anything else must fail loudly --
-            # including the MCP server's "exec_disabled", which means this
-            # harness lost its --enable-exec and is no longer testing the
-            # escape hatch at all.
-            if failure.startswith("disabled:"):
+            if is_plugin_gated(failure):
                 skip("run_python and its error-path checks",
                      "(plugin gate closed: launch Krita with "
                      "KRITA_MCP_ALLOW_PYTHON=1 to exercise them)")
@@ -544,7 +550,8 @@ def main():
                               {"code": "raise ValueError('boom')"})
             got = json.loads(_text_of(raw))
             check("run_python reports errors without killing the bridge",
-                  got.get("ok") is False and "boom" in got.get("exception", ""),
+                  got.get("ok") is False
+                  and "boom" in got.get("exception", ""),
                   str(got)[:200])
 
         client.ok("set_selection", {"document": doc_name, "mode": "rect",
