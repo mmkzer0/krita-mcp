@@ -80,7 +80,7 @@ class KritaMcpExtension(Extension):
             # up edited operations without restarting Krita.
             # Snapshot the exec gate on the GUI thread: /health answers on a
             # worker thread and must not touch libkis.
-            ops.refresh_python_exec_snapshot()
+            ops.python_exec_enabled()
             self._bridge = Bridge(
                 invoker=self._invoker,
                 dispatch=lambda name, params: ops.dispatch(name, params),
@@ -125,7 +125,7 @@ class KritaMcpExtension(Extension):
     def _on_status(self):
         if self._bridge is not None and self._bridge.running:
             # GUI thread: re-read the gate before showing it.
-            exec_enabled = ops.refresh_python_exec_snapshot()
+            exec_enabled = ops.python_exec_enabled()
             body = (
                 "Running on http://127.0.0.1:{0}\n"
                 "Operations: {1}\n"
