@@ -9,7 +9,6 @@ cannot drive Krita.
 import json
 import os
 import secrets
-import socket
 import sys
 import threading
 import time
@@ -50,6 +49,14 @@ def info_file_path():
 
 def trace_file_path():
     return os.path.join(state_dir(), "krita_mcp_trace.log")
+
+
+def _unlink_quietly(path):
+    """Remove a file this process created, without letting a failure escape."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 class Trace(object):
@@ -325,6 +332,13 @@ class Bridge(object):
 
     # -- discovery file ---------------------------------------------------
     def _write_info_file(self):
+        """Publish where this bridge listens, owner-readable from creation.
+
+        The token is what the file is for, so it must never sit in a file
+        another account can read -- not even for the instant between a default
+        umask and a chmod. A unique name plus O_EXCL means a stale temp from an
+        earlier crash is never reused or followed through a symlink.
+        """
         path = info_file_path()
         payload = {
             "url": "http://127.0.0.1:{0}".format(self.port),
@@ -333,19 +347,25 @@ class Bridge(object):
             "pid": os.getpid(),
             "plugin_version": self.plugin_version,
             "krita_version": self.krita_version,
-            "host": socket.gethostname(),
         }
         directory = os.path.dirname(path)
         if directory and not os.path.isdir(directory):
             os.makedirs(directory, exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-        os.replace(tmp, path)
-        try:  # best effort: keep the token off other accounts on this box
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+        tmp = "{0}.{1}.tmp".format(path, secrets.token_hex(6))
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+        except Exception:
+            os.close(fd)
+            _unlink_quietly(tmp)
+            raise
+        try:
+            with handle:
+                json.dump(payload, handle, indent=2)
+            os.replace(tmp, path)
+        except Exception:
+            _unlink_quietly(tmp)
+            raise
 
     def _remove_info_file(self):
         """Delete the discovery file, but only if it still describes us.
