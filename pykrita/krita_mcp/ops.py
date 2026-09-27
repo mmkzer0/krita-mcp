@@ -42,10 +42,16 @@ from .compat import (
 )
 
 from . import imaging
-from .gate import ENV_VAR, Gate, SETTING_KEY, UNSET, runs_code, summary
+from .gate import (ENV_VAR, Gate, SETTING_KEY, UNSET, runs_code, summary,
+                   truthy)
 from .imaging import ImagingError, parse_color
 
 PLUGIN_VERSION = "1.0.0"
+
+# Escape hatch for the size-changing operations. Krita 5.3.4 aborts in its own
+# canvas code when a document changes size under a view (see _refuse_on_view),
+# so those edits are refused unless this is set to 1.
+VIEWED_GEOMETRY_ENV = "KRITA_MCP_ALLOW_VIEWED_GEOMETRY"
 
 # Owned here; extension.py imports it so the gate and the settings reader
 # cannot drift apart (Krita reads [krita_mcp] from kritarc).
@@ -560,6 +566,52 @@ def _refresh(doc):
     doc.waitForDone()
 
 
+def _refuse_on_view(doc, op_name):
+    """Refuse a size-changing edit while a canvas shows this document.
+
+    Krita 5.3.4 aborts in its own canvas code when a document changes size
+    under a view. The update Krita coalesces for the canvas is delivered later
+    by a timer and rebuilds the OpenGL texture cache for a document that has
+    already moved on, which trips
+
+        ASSERT: "m_textureTiles.size() > tile"
+        kis_opengl_image_textures.h:127
+
+    from ``KisOpenGLImageTextures::recalculateCache`` (crash report
+    2026-09-26 21:21:41; the same timer also reaches
+    ``KisNodeModel::processUpdateQueue``, which segfaulted at 21:21:09). The
+    measured rate is one death per one to eight scripted edits of a viewed
+    document, and it does not depend on this plugin's own projection refresh:
+    a diagnostic that skipped that refresh died just the same, and pumping the
+    event loop *inside* the operation only delivers the fatal timer sooner. So
+    there is no plugin-side wait that makes these edits safe.
+
+    A view-less document never reaches that code -- no canvas, no coalesced
+    update -- and runs the same edits for three 30-iteration soaks without a
+    crash, which is what ``view: false`` in create_document/open_document is
+    for. Operations that do not change the size (draw, layers, filters,
+    flatten) are unaffected and stay usable on a viewed document: the tile
+    grid they index is unchanged.
+
+    ``KRITA_MCP_ALLOW_VIEWED_GEOMETRY=1`` runs the edit anyway, for measuring
+    the Krita defect rather than for normal work.
+    """
+    if _view_count(doc) == 0:
+        return
+    if truthy(os.environ.get(VIEWED_GEOMETRY_ENV)):
+        _trace("{0}: viewed geometry allowed by {1}".format(
+            op_name, VIEWED_GEOMETRY_ENV))
+        return
+    raise OpError(
+        "{0} changes the document's size while a canvas shows it, and Krita "
+        "aborts in its own texture cache when that happens (see the README's "
+        "crash note). Create or open the document with view=false for "
+        "scripted edits, or close the document's views first. Set {1}=1 to "
+        "run the edit anyway and risk taking Krita down with it.".format(
+            op_name, VIEWED_GEOMETRY_ENV),
+        kind="unsafe_on_view")
+
+
 def _trace(text):
     """Write a step marker to the bridge trace log, if tracing is on."""
     try:
@@ -725,6 +777,7 @@ def _attach_view(doc, params):
         return False, ("No Krita main window was available, so the document "
                        "is open in memory but not shown.")
     window.addView(doc)
+    _trace("view: addView returned")
     return True, None
 
 
@@ -750,6 +803,7 @@ def op_create_document(params):
             "{0!r} / color_depth {1!r} / profile {2!r} are a valid combination "
             "(see list_color_spaces).".format(color_model, color_depth, profile))
     doc.setBatchmode(True)
+    _trace("create: document made")
 
     background = params.get("background")
     if background is not None:
@@ -759,9 +813,11 @@ def op_create_document(params):
             image = QImage(width, height, QImage.Format_ARGB32)
             image.fill(color)
             imaging.write_node_image(node, QRect(0, 0, width, height), image)
+    _trace("create: background written")
 
     view_added, note = _attach_view(doc, params)
     _refresh(doc)
+    _trace("create: refreshed")
 
     result = _doc_summary(doc)
     result["view_added"] = view_added
@@ -783,8 +839,10 @@ def op_open_document(params):
             "Krita could not open {0}. The format may be unsupported or the "
             "file may be damaged.".format(path))
     doc.setBatchmode(True)
+    _trace("open: document loaded")
     view_added, note = _attach_view(doc, params)
     _refresh(doc)
+    _trace("open: refreshed")
     result = _doc_summary(doc)
     result["view_added"] = view_added
     if note:
@@ -938,6 +996,7 @@ def op_resize_canvas(params):
     height = _as_int(_req(params, "height"), "height")
     if width < 1 or height < 1:
         raise OpError("width and height must be at least 1")
+    _refuse_on_view(doc, "resize_canvas")
     before = _doc_summary(doc)
     doc.resizeImage(x, y, width, height)
     _refresh(doc)
@@ -954,6 +1013,7 @@ def op_scale_image(params):
     strategy = str(_arg(params, "strategy", "Bicubic"))
     xres = _as_float(_arg(params, "x_res", doc.xRes()), "x_res")
     yres = _as_float(_arg(params, "y_res", doc.yRes()), "y_res")
+    _refuse_on_view(doc, "scale_image")
     before = _doc_summary(doc)
     doc.scaleImage(width, height, int(xres), int(yres), strategy)
     _refresh(doc)
@@ -966,6 +1026,7 @@ def op_rotate_image(params):
     import math
     doc = resolve_document(params.get("document"))
     degrees = _as_float(_req(params, "degrees"), "degrees")
+    _refuse_on_view(doc, "rotate_image")
     before = _doc_summary(doc)
     doc.rotateImage(math.radians(degrees))
     _refresh(doc)
@@ -981,6 +1042,7 @@ def op_crop_image(params):
     height = _as_int(_req(params, "height"), "height")
     if width < 1 or height < 1:
         raise OpError("width and height must be at least 1")
+    _refuse_on_view(doc, "crop_image")
     before = _doc_summary(doc)
     doc.crop(x, y, width, height)
     _refresh(doc)
@@ -991,6 +1053,9 @@ def op_crop_image(params):
 def op_flatten_image(params):
     doc = resolve_document(params.get("document"))
     doc.flatten()
+    # No _refuse_on_view here: flatten replaces the layer stack but leaves the
+    # document's size -- and with it the canvas tile grid the crash above
+    # indexes by -- unchanged.
     _refresh(doc)
     return {"flattened": True, "layers": layer_tree(doc, 1)}
 

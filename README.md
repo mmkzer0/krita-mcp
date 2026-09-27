@@ -125,7 +125,7 @@ Restart the client. Krita must be running for the tools to do anything.
 | `create_document` / `open_document` | Make or load a document |
 | `save_document` / `export_document` | Save in place or save-as; export to PNG/JPEG/etc. |
 | `close_document` | Close a document (see *Known issue*) |
-| `transform_image` | resize canvas, scale, rotate, crop, flatten |
+| `transform_image` | resize canvas, scale, rotate, crop, flatten; the size-changing ones need a view-less document (see *Known issue*) |
 | `create_layer` / `set_layer` / `delete_layer` | Layer stack management |
 | `duplicate_layer` / `move_layer` / `merge_layer_down` | Restacking and merging |
 | `get_image` | Render the canvas and return a PNG Claude can see |
@@ -240,11 +240,13 @@ is visible rather than silent.
 
 **Scripted documents can stay off the canvas.** `create_document` and
 `open_document` take `view: false` to keep a document out of Krita's windows.
-That is the mode for long automated runs: nothing repaints and the document
-never enters the canvas/OpenGL path where the geometry operations crash (see
-*Known issue*). `status` and `inspect_document` report a `views` count, so a
-caller can confirm which mode it got. The default stays `view: true` — a
-visible document is what makes "watch the agent paint" work.
+That is the mode for long automated runs, and the only mode in which the
+size-changing geometry is allowed: `transform_image` with `crop`, `scale`,
+`rotate` or `resize_canvas` is refused on a document a canvas is showing
+(kind `unsafe_on_view`, see *Known issue*). `status` and `inspect_document`
+report a `views` count, so a caller can confirm which mode it got. The default
+stays `view: true` — a visible document is what makes "watch the agent paint"
+work.
 
 **Direct pixel access needs RGBA/8-bit.** `draw`, `get_pixel` and per-layer
 `get_image` refuse other colour spaces with a clear message. The merged
@@ -253,25 +255,54 @@ visible document is what makes "watch the agent paint" work.
 ## Known issue: Krita can crash under sustained scripting
 
 Two native faults are on record on macOS, both inside Krita's C++, neither
-reachable from plugin code:
+reachable from plugin code.
 
-**Geometry on a viewed document.** `scale`, `rotate`, `crop` and friends run
-back to back on a document that is on a canvas abort Krita in its OpenGL tile
+**A viewed document must not change size.** `resize_canvas`, `scale`, `rotate`
+and `crop` on a document that is on a canvas can abort Krita in its OpenGL tile
 cache (`ASSERT: "m_textureTiles.size() > tile"`,
-`libs/ui/opengl/kis_opengl_image_textures.h`). Measured on Krita 5.3.4: 7 of 7
-view-attached soak runs died after 1–9 iterations, while documents created with
-`view: false` survived 3 × 30 iterations of the same workload. Off-canvas is
-the mode for long scripted work; it is a mitigation, not a fix — the projection
-refresh after every mutation is still unproven.
+`libs/ui/opengl/kis_opengl_image_textures.h:127`). The crash report from
+2026-09-26 21:21:41 names the path: the update Krita coalesces for the canvas is
+delivered later by a timer and rebuilds the texture cache for a document that
+has already moved on.
+
+```
+KisOpenGLImageTextures::recalculateCache(KisUpdateInfo, bool)
+  <- KisOpenGLCanvas2::updateCanvasProjection
+  <- KisCanvas2::updateCanvasProjection
+  <- KisSignalCompressor::tryEmitOnTick        (timer tick)
+```
+
+Measured on Krita 5.3.4: every view-attached soak run that executed those four
+operations died — the three baseline runs after 1–5 iterations, the geometry
+control in iteration 1, and four further runs on intermediate builds after 1–9
+iterations — while the same revision and workload *without* them closes 90 of
+90 viewed documents without a fault, and a view-less document runs the full
+geometry for 3 × 30 iterations. Pumping the event loop *inside* the operation
+only delivers that fatal timer sooner, so there is no plugin-side wait that
+makes the edits safe. The bridge therefore refuses them on a viewed document
+(kind `unsafe_on_view`) and names the workaround, which is `view: false`;
+`KRITA_MCP_ALLOW_VIEWED_GEOMETRY=1` runs them anyway, for measuring the defect
+rather than for normal work. `flatten` stays available on a viewed document
+because it leaves the size — and with it the tile grid — alone.
+
+A viewed document that is *not* resized is stable: it survives sitting idle,
+and it closes as reliably as the close path below. Do not clear its batch mode.
+A document that is on a canvas and *also* gets GUI updates dies within seconds
+on this build (measured: idle death after 10s with batch mode off, no death in
+120s with it on), which is why `create_document` and `open_document` leave
+batch mode on for a viewed document.
 
 **Closing a long-edited document.** `close_document` occasionally takes Krita
 down after `Document.close()` has returned — upstream's "roughly one close in
 five at the end of a long editing session"; a freshly created or lightly edited
-document closes reliably. Tried and ruled out: draining the image scheduler,
-disabling autosave, clearing the modified flag, forcing a GC, pumping the event
-loop, closing views first, and saving before closing — that last one is the
-intuitive fix and it doesn't help. Whether this is the same fault as Krita's own
-*File → Close* was never reproduced by hand, so treat that claim as unverified.
+document closes reliably. Today's reproduction (2026-09-27, trace shows
+`close: close call returned` and nothing after it, in the settle that follows):
+a 400×300 document that had been open for about a minute. Tried and ruled out:
+draining the image scheduler, disabling autosave, clearing the modified flag,
+forcing a GC, pumping the event loop, closing views first, and saving before
+closing — that last one is the intuitive fix and it doesn't help. Whether this
+is the same fault as Krita's own *File → Close* was never reproduced by hand,
+so treat that claim as unverified.
 
 **Prefer closing documents yourself, and keep long automation off a canvas.**
 If Krita does die, nothing hangs: the next call reports "could not reach Krita",
@@ -291,6 +322,11 @@ make sure the path to `mcp_server.py` is absolute.
 **Port already in use** — the bridge scans upward from 9797 and writes whichever
 port it got into the discovery file, so this normally resolves itself. Set a
 different starting port with `port=` under `[krita_mcp]` in `kritarc`.
+
+**"unsafe_on_view"** — the size-changing geometry was asked for on a document
+that is on a canvas, which can take Krita down (see *Known issue*). Create or
+open the document with `view: false`, or start Krita with
+`KRITA_MCP_ALLOW_VIEWED_GEOMETRY=1` to run the edit anyway.
 
 **"run_python is disabled"** — that is the default (see *Arbitrary Python is
 opt-in*). A model seeing this wants both switches: `--enable-exec` on the MCP

@@ -496,35 +496,67 @@ def main():
 
         # ---------------------------------------------------------------
         section("geometry")
-        got, _ = client.ok("transform_image", {"document": doc_name,
+        # A document that is on a canvas must not change size: Krita aborts in
+        # its own texture cache when it does (see the README's crash note), so
+        # the bridge refuses the size-changing operations there. The section
+        # checks that refusal on the viewed document and then runs the real
+        # edits on a view-less one, which is the supported mode for scripted
+        # work.
+        refused = client.call("transform_image", {"document": doc_name,
+                                                  "action": "crop", "x": 0,
+                                                  "y": 0, "width": 300,
+                                                  "height": 200})
+        text = _text_of(refused)
+        check("crop on a viewed document is refused",
+              refused.get("isError") is True
+              and text.startswith("unsafe_on_view"), text[:200])
+        check("the refusal names the view=false workaround",
+              "view=false" in text, text[:200])
+        still, _ = client.ok("inspect_document", {"document": doc_name})
+        check("the refused crop left the document alone",
+              still.get("width") == 400 and still.get("height") == 300,
+              str(still)[:200])
+
+        geo_name = doc_name + " geo"
+        geo, _ = client.ok("create_document", {
+            "width": 400, "height": 300, "name": geo_name,
+            "background": "#202830", "view": False,
+        })
+        check("view-less document has no canvas", geo.get("views") == 0,
+              str(geo)[:200])
+        client.ok("create_layer", {"document": geo_name, "name": "Art"})
+
+        got, _ = client.ok("transform_image", {"document": geo_name,
                                                "action": "crop", "x": 0,
                                                "y": 0, "width": 300,
                                                "height": 200})
         check("crop applied", got["after"]["width"] == 300, str(got.get("after")))
 
-        got, _ = client.ok("transform_image", {"document": doc_name,
+        got, _ = client.ok("transform_image", {"document": geo_name,
                                                "action": "scale",
                                                "width": 150, "height": 100})
         check("scale applied", got["after"]["width"] == 150,
               str(got.get("after")))
 
-        got, _ = client.ok("transform_image", {"document": doc_name,
+        got, _ = client.ok("transform_image", {"document": geo_name,
                                                "action": "resize_canvas",
                                                "x": 0, "y": 0, "width": 200,
                                                "height": 150})
         check("canvas resized", got["after"]["width"] == 200,
               str(got.get("after")))
 
-        got, _ = client.ok("transform_image", {"document": doc_name,
+        got, _ = client.ok("transform_image", {"document": geo_name,
                                                "action": "rotate",
                                                "degrees": 90})
         check("rotate applied", got["after"]["height"] == 200,
               str(got.get("after")))
 
-        got, _ = client.ok("transform_image", {"document": doc_name,
+        got, _ = client.ok("transform_image", {"document": geo_name,
                                                "action": "flatten"})
         check("flatten collapsed the stack", len(got.get("layers", [])) == 1,
               str(got.get("layers")))
+        client.ok("close_document", {"document": geo_name,
+                                     "discard_changes": True})
 
         # ---------------------------------------------------------------
         section("saving")
@@ -551,7 +583,7 @@ def main():
 
         section("saving.reopen")
         got, _ = client.ok("open_document", {"path": png_path})
-        check("exported png reopens", got.get("width") == 150, str(got))
+        check("exported png reopens", got.get("width") == 400, str(got))
         client.ok("close_document", {"document": got.get("name"),
                                      "discard_changes": True})
 

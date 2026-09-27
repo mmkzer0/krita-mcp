@@ -490,7 +490,11 @@ TOOLS = [
          "Whole-image geometry. `action` picks the operation: resize_canvas "
          "(change the canvas, keeping layer pixels where they are), scale "
          "(resample everything), rotate (by degrees, clockwise), crop, or "
-         "flatten (merge all layers into one).",
+         "flatten (merge all layers into one). Everything except flatten "
+         "changes the document's size, which Krita aborts on while a canvas "
+         "shows the document, so those four are refused there (kind "
+         "`unsafe_on_view`) -- create or open the document with view=false to "
+         "run them; flatten stays available either way.",
          {"document": DOCUMENT_PROP,
           "action": {"type": "string",
                      "enum": ["resize_canvas", "scale", "rotate", "crop",

@@ -299,19 +299,43 @@ def _verify_view(doc_name, want_view):
             "attached.".format(doc_name, views))
 
 
-def _geometry(name):
+def _expect_refusal(op, params, kind):
+    """Call an operation the bridge is expected to refuse.
+
+    A refusal counts as an expected outcome, an unrefused call as an
+    unexpected one: a viewed document must not reach Krita's canvas code here.
+    """
+    try:
+        call(op, params, timeout=60)
+    except BridgeError as exc:
+        if exc.kind != kind:
+            raise
+        TOTALS["expected_failures"] += 1
+    else:
+        TOTALS["unexpected_successes"] += 1
+        print("    note: {0} was allowed on a viewed document".format(op))
+
+
+def _geometry(name, view):
     """The canvas geometry a suite-like iteration runs on a document.
 
     Its own group because these are the operations that destabilise a document
-    that is on a canvas (see the README's crash note). A run without them still
-    edits, saves, exports and closes one document per iteration, so a death
-    there is not the canvas path's doing.
+    that is on a canvas: the bridge refuses the size-changing ones there
+    (see the README's crash note), so a viewed run records those refusals and
+    exercises flatten, which leaves the size alone. STRESS_VIEW=0 runs all of
+    them, which is the mode long scripted work is supposed to use.
     """
-    call("crop_image", {"document": name, "x": 0, "y": 0,
-                        "width": 220, "height": 160}, timeout=60)
-    call("scale_image", {"document": name, "width": 150,
-                         "height": 110}, timeout=90)
-    call("rotate_image", {"document": name, "degrees": 90}, timeout=60)
+    size_changing = (
+        ("crop_image", {"x": 0, "y": 0, "width": 220, "height": 160}, 60),
+        ("scale_image", {"width": 150, "height": 110}, 90),
+        ("rotate_image", {"degrees": 90}, 60),
+    )
+    for op, params, timeout in size_changing:
+        params = dict(params, document=name)
+        if view:
+            _expect_refusal(op, params, "unsafe_on_view")
+        else:
+            call(op, params, timeout=timeout)
     call("flatten_image", {"document": name}, timeout=60)
 
 
@@ -426,7 +450,7 @@ def _build(tmpdir, index, groups, view):
                            "y": 5, "width": 40, "height": 40})
     call("set_selection", {"document": NAME, "mode": "none"})
     if "geometry" in groups:
-        _geometry(NAME)
+        _geometry(NAME, view)
     _roundtrip(tmpdir, index, view)
     if "errors" in groups:
         _errors(NAME)
