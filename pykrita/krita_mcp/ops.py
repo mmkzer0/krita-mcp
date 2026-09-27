@@ -210,7 +210,44 @@ def _ensure_parent_dir(path):
 # documents
 # --------------------------------------------------------------------------
 
+_VIEWLESS = []          # documents the plugin keeps alive without a canvas
+
+
+def _prune_viewless():
+    """Drop references to view-less documents Krita no longer has open.
+
+    Closing one releases our reference (see op_close_document); this catches
+    the ones closed by other means, for instance by hand in Krita.
+    """
+    if not _VIEWLESS:
+        return
+    open_now = _krita().documents()
+    for known in list(_VIEWLESS):
+        if not any(known == doc for doc in open_now):
+            _VIEWLESS.remove(known)
+
+
+def _remember_viewless(doc):
+    """Keep a view-less document alive until it is closed.
+
+    libkis hands the caller ownership of a document created through the API:
+    once the Python wrapper is collected, Krita destroys the document -- a
+    canvas-less document has nothing else holding it. Releasing the reference
+    after close() is what lets Krita free it again.
+    """
+    _VIEWLESS.append(doc)
+
+
+def _forget_viewless(doc):
+    """Release the reference this plugin holds for a view-less document."""
+    for known in list(_VIEWLESS):
+        if known == doc:
+            _VIEWLESS.remove(known)
+            return
+
+
 def _documents():
+    _prune_viewless()
     return list(_krita().documents())
 
 
@@ -285,6 +322,21 @@ def _document_index(doc):
     return -1
 
 
+def _view_count(doc):
+    """How many GUI views show this document.
+
+    libkis has no Document.views(), so this walks the windows. View.document()
+    hands back a fresh wrapper each call, but the wrappers compare equal by
+    the underlying pointer, which is what makes `==` the identity test here.
+    """
+    count = 0
+    for window in _krita().windows():
+        for view in window.views():
+            if view.document() == doc:
+                count += 1
+    return count
+
+
 def _doc_summary(doc):
     return {
         "index": _document_index(doc),
@@ -297,6 +349,10 @@ def _doc_summary(doc):
         "color_profile": doc.colorProfile(),
         "resolution_dpi": round(doc.resolution(), 3),
         "modified": bool(doc.modified()),
+        # 0 means the document exists in memory but is not on a canvas (see
+        # create_document/open_document `view`), which is what keeps scripted
+        # documents out of the canvas and OpenGL texture path.
+        "views": _view_count(doc),
     }
 
 
@@ -648,6 +704,31 @@ def op_list_filters(params):
 # document lifecycle
 # --------------------------------------------------------------------------
 
+def _attach_view(doc, params):
+    """Put the document on a canvas unless the caller asked for none.
+
+    Owns the `view` parameter -- its name, default and lifetime rule -- so
+    create_document and open_document cannot drift apart.
+
+    A view is what makes "watch the agent paint" work, so it stays the
+    default. view=false keeps the document off the canvas, which keeps it out
+    of the widget/OpenGL texture path that the geometry operations destabilise
+    (see the README's crash note).
+
+    Returns (view_added, note) for the operation's result.
+    """
+    if not _as_bool(_arg(params, "view", True), "view"):
+        _remember_viewless(doc)
+        return False, "view=false: open in memory only, not on a canvas."
+    window = _krita().activeWindow()
+    if window is None:
+        _remember_viewless(doc)
+        return False, ("No Krita main window was available, so the document "
+                       "is open in memory but not shown.")
+    window.addView(doc)
+    return True, None
+
+
 @op("create_document", timeout=60.0, mutates=True)
 def op_create_document(params):
     krita = _krita()
@@ -680,18 +761,13 @@ def op_create_document(params):
             image.fill(color)
             imaging.write_node_image(node, QRect(0, 0, width, height), image)
 
-    window = krita.activeWindow()
-    view_added = False
-    if window is not None:
-        window.addView(doc)
-        view_added = True
+    view_added, note = _attach_view(doc, params)
     _refresh(doc)
 
     result = _doc_summary(doc)
     result["view_added"] = view_added
-    if not view_added:
-        result["note"] = ("No Krita main window was available, so the document "
-                          "is open in memory but not shown.")
+    if note:
+        result["note"] = note
     return result
 
 
@@ -708,11 +784,13 @@ def op_open_document(params):
             "Krita could not open {0}. The format may be unsupported or the "
             "file may be damaged.".format(path))
     doc.setBatchmode(True)
-    window = krita.activeWindow()
-    if window is not None:
-        window.addView(doc)
+    view_added, note = _attach_view(doc, params)
     _refresh(doc)
-    return _doc_summary(doc)
+    result = _doc_summary(doc)
+    result["view_added"] = view_added
+    if note:
+        result["note"] = note
+    return result
 
 
 @op("save_document", timeout=180.0, mutates=True)
@@ -843,6 +921,7 @@ def op_close_document(params):
     doc.close()
     _trace("close: close call returned")
     _settle_after_close()
+    _forget_viewless(doc)
     _trace("close: settled")
     return {"closed": True, "document": summary}
 

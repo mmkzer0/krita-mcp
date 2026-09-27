@@ -296,8 +296,13 @@ class Bridge(object):
 
         except MainThreadTimeout as exc:
             self.trace.write("<-- {0} TIMEOUT".format(name))
+            # A cancelled job provably did not run; one that had already
+            # started may still finish, so it is reported as unknown rather
+            # than as a plain "busy" refusal.
+            kind = ("outcome_unknown" if exc.reason == "still_running"
+                    else "krita_busy")
             return 504, {"ok": False, "op": name, "error": {
-                "type": "krita_busy", "message": str(exc)}}
+                "type": kind, "message": str(exc)}}
 
         except MainThreadError as exc:
             self.trace.write("<-- {0} error {1}".format(name, exc.type_name))

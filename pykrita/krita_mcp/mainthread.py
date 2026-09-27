@@ -20,7 +20,16 @@ from .compat import QObject, QtCompat as Qt, QTimer, pyqtSignal
 
 
 class MainThreadTimeout(Exception):
-    """The GUI thread did not run the job before the deadline."""
+    """The GUI thread did not run the job before the deadline.
+
+    ``reason`` is "not_started" when the job was still queued and got
+    cancelled -- it provably never ran -- or "still_running" when it had
+    already begun and may yet complete.
+    """
+
+    def __init__(self, message, reason="not_started"):
+        super().__init__(message)
+        self.reason = reason
 
 
 class MainThreadError(Exception):
@@ -44,18 +53,14 @@ class MainThreadError(Exception):
 
 
 class _Job(object):
-    __slots__ = ("fn", "event", "result", "failed", "kind", "type_name",
-                 "message", "formatted")
+    __slots__ = ("fn", "event", "result", "failure", "state")
 
     def __init__(self, fn):
         self.fn = fn
         self.event = threading.Event()
         self.result = None
-        self.failed = False
-        self.kind = None
-        self.type_name = ""
-        self.message = ""
-        self.formatted = ""
+        self.failure = None         # (kind, type_name, message, formatted)
+        self.state = "queued"       # queued -> running -> finished | cancelled
 
 
 class MainThreadInvoker(QObject):
@@ -67,39 +72,54 @@ class MainThreadInvoker(QObject):
         # keeps working even if a future caller happens to be on the GUI thread.
         self._submit.connect(self._execute, Qt.QueuedConnection)
         self._home_ident = threading.get_ident()
+        # Guards _Job.state between the waiting worker and the GUI thread, so
+        # a cancelled job cannot start in the window after the deadline.
+        self._state_lock = threading.Lock()
         self._busy = False
 
     def _execute(self, job):
-        if self._busy:
-            # Another job is running and is pumping the event loop (the
-            # settle after a document close does this), which is how we got
-            # delivered mid-operation. Re-entering libkis underneath a call
-            # that is already in progress is not safe, so hand the job back
-            # to the queue and pick it up once the outer one has finished.
-            QTimer.singleShot(0, lambda: self._execute(job))
-            return
+        with self._state_lock:
+            if job.state != "queued":
+                # Its caller's deadline passed and cancelled it, or it has
+                # already run. Running it now would mutate Krita for an
+                # operation nobody is waiting for any more.
+                return
+            if self._busy:
+                # Another job is running and is pumping the event loop (the
+                # settle after a document close does this), which is how we got
+                # delivered mid-operation. Re-entering libkis underneath a call
+                # that is already in progress is not safe, so hand the job back
+                # to the queue and pick it up once the outer one has finished.
+                QTimer.singleShot(0, lambda: self._execute(job))
+                return
+            job.state = "running"
 
         self._busy = True
         try:
             job.result = job.fn()
         except BaseException as exc:  # reported to the caller, never swallowed
-            job.failed = True
-            job.kind = getattr(exc, "kind", None)
-            job.type_name = type(exc).__name__
-            job.message = str(exc)
-            job.formatted = traceback.format_exc()
-            # Drop the frames now rather than leaving them for the collector:
-            # they may hold libkis wrappers (see MainThreadError).
+            # Plain strings only, in the order MainThreadError takes them: the
+            # exception itself must not outlive the call, because its
+            # traceback frames may hold libkis wrappers (see MainThreadError).
+            job.failure = (getattr(exc, "kind", None), type(exc).__name__,
+                           str(exc), traceback.format_exc())
             exc.__traceback__ = None
         finally:
             self._busy = False
+            with self._state_lock:
+                job.state = "finished"
             job.event.set()
 
     def call(self, fn, timeout=30.0):
         """Run ``fn`` on the GUI thread and return its value.
 
-        Raises MainThreadTimeout if the GUI thread is unresponsive, or
-        MainThreadError wrapping whatever ``fn`` raised.
+        Raises MainThreadTimeout when the deadline passes, or MainThreadError
+        wrapping whatever ``fn`` raised.
+
+        A job still queued at the deadline is cancelled and provably never runs
+        (``reason`` "not_started"). One that had already started cannot be
+        stopped from here, so the timeout says so (``reason`` "still_running")
+        instead of implying that nothing happened.
         """
         if threading.get_ident() == self._home_ident:
             # Already home. Emitting would deadlock: a queued signal would not
@@ -109,12 +129,23 @@ class MainThreadInvoker(QObject):
         job = _Job(fn)
         self._submit.emit(job)
         if not job.event.wait(timeout):
-            raise MainThreadTimeout(
-                "Krita's UI thread did not respond within {0:g}s. It is most "
-                "likely blocked by a modal dialog or a long running "
-                "operation.".format(timeout)
-            )
-        if job.failed:
-            raise MainThreadError(job.kind, job.type_name, job.message,
-                                  job.formatted)
+            with self._state_lock:
+                state = job.state
+                if state == "queued":
+                    job.state = "cancelled"
+            if state == "queued":
+                raise MainThreadTimeout(
+                    "Krita's UI thread did not pick this operation up within "
+                    "{0:g}s, so it was cancelled before it started.".format(
+                        timeout), reason="not_started")
+            if state == "running":
+                raise MainThreadTimeout(
+                    "Krita's UI thread is still running this operation after "
+                    "{0:g}s. It may still complete, so its outcome is "
+                    "unknown; check the document before repeating it.".format(
+                        timeout), reason="still_running")
+            # "finished": it won the race with the deadline, so report the
+            # outcome below instead of inventing a timeout.
+        if job.failure is not None:
+            raise MainThreadError(*job.failure)
         return job.result

@@ -55,6 +55,20 @@ class BridgeError(Exception):
         self.detail = detail
 
 
+class _TransportFailure(Exception):
+    """A socket failure, tagged with the phase it happened in.
+
+    The phase decides whether a retry is honest. A connection that was never
+    established proves the bridge never saw the request; a connection lost
+    after that leaves the operation's outcome unknown.
+    """
+
+    def __init__(self, phase, cause):
+        super().__init__("{0}: {1}".format(type(cause).__name__, cause))
+        self.phase = phase          # "connect", "send" or "response"
+        self.cause = cause
+
+
 def state_dir():
     """Krita's per-user data directory -- must match the plugin's copy."""
     override = os.environ.get("KRITA_MCP_STATE_DIR")
@@ -127,7 +141,11 @@ class BridgeClient:
     def _request(self, method, path, body, timeout, info):
         conn = http.client.HTTPConnection(info["host"], info["port"],
                                           timeout=timeout)
+        phase = "connect"
         try:
+            # Connect explicitly: a failure here is the one transport error
+            # that proves the bridge never saw the request.
+            conn.connect()
             headers = {"Connection": "close"}
             payload = None
             if body is not None:
@@ -135,10 +153,14 @@ class BridgeClient:
                 headers["Content-Type"] = "application/json"
                 headers["Content-Length"] = str(len(payload))
                 headers["X-Krita-MCP-Token"] = info["token"]
+            phase = "send"
             conn.request(method, path, body=payload, headers=headers)
+            phase = "response"
             response = conn.getresponse()
             raw = response.read()
             status = response.status
+        except OSError as exc:      # covers refused, reset and timed out
+            raise _TransportFailure(phase, exc)
         finally:
             try:
                 conn.close()
@@ -155,37 +177,93 @@ class BridgeClient:
                 raw[:500].decode("utf-8", "replace"))
         return status, parsed
 
+    def _listening(self, info, timeout=2.0):
+        """Is anything accepting connections where the discovery file points?
+
+        Only used to classify a failure: a refused connection right after one
+        proves the bridge is gone; an accepted one means it is still there.
+        """
+        conn = http.client.HTTPConnection(info["host"], info["port"],
+                                          timeout=timeout)
+        try:
+            conn.connect()
+        except OSError:
+            return False
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return True
+
+    def _transport_reason(self, op, info, failure):
+        """The error a transport failure should surface as.
+
+        Only a connection that was never established is retried (see _post),
+        so what arrives here has an honest but possibly incomplete story: a
+        refused connection means nothing was sent, while a connection lost
+        afterwards means the operation may already have been applied. That is
+        never replayed; the caller is told to check instead.
+        """
+        cause = "{0}: {1}".format(type(failure.cause).__name__, failure.cause)
+        if failure.phase == "connect":
+            return BridgeUnavailable(
+                "{0}\n\nThe operation was not sent: {1}.".format(
+                    NOT_RUNNING_HELP.format(path=info_file_path()), cause))
+        if not self._listening(info):
+            return BridgeUnavailable(
+                "The bridge stopped answering while {0!r} was in flight "
+                "({1}). It may have crashed, restarted or be wedged, and "
+                "whether the operation took effect is unknown -- check the "
+                "document before repeating it.\n\n{2}".format(
+                    op, cause, NOT_RUNNING_HELP.format(path=info_file_path())))
+        return BridgeError(
+            "outcome_unknown",
+            "{0!r} was sent to Krita but its response was lost ({1}). The "
+            "operation may or may not have been applied, so it was not "
+            "retried; check the document (status, inspect_document) before "
+            "repeating it.".format(op, cause))
+
+    def _post(self, op, body, timeout):
+        """POST one /rpc call, following at most one discovery reload.
+
+        A reload is only allowed when the first attempt provably never reached
+        the bridge: the connection was refused before anything was written, or
+        the token was rejected before the operation ran. Anything that failed
+        after the request was transmitted is reported, never replayed.
+        """
+        with self._lock:
+            info = self._load_info()
+        try:
+            status, parsed = self._request("POST", "/rpc", body, timeout, info)
+        except _TransportFailure as failure:
+            if failure.phase != "connect":
+                raise self._transport_reason(op, info, failure)
+            return self._post_after_reload(op, body, timeout)
+        if status != 401:
+            return status, parsed
+        # A stale token is refused before the operation runs, so re-reading
+        # discovery and trying once more is safe.
+        return self._post_after_reload(op, body, timeout)
+
+    def _post_after_reload(self, op, body, timeout):
+        """The one retry both retryable failures share: reload, then resend."""
+        with self._lock:
+            info = self._load_info(force=True)
+        try:
+            return self._request("POST", "/rpc", body, timeout, info)
+        except _TransportFailure as failure:
+            raise self._transport_reason(op, info, failure)
+
     def call(self, op, params=None, timeout=CALL_TIMEOUT):
         body = {"op": op, "params": params or {}}
-        last_exc = None
-
-        # Two passes: if the first fails at the socket or auth layer, Krita has
-        # probably restarted onto a new port/token, so re-read the info file.
-        for attempt in (0, 1):
-            with self._lock:
-                info = self._load_info(force=(attempt == 1))
-            try:
-                status, parsed = self._request("POST", "/rpc", body, timeout, info)
-            except OSError as exc:  # covers refused, reset and timed out
-                last_exc = exc
-                continue
-
-            if status == 401 and attempt == 0:
-                with self._lock:
-                    self._info = None
-                continue
-
-            if parsed.get("ok"):
-                return parsed.get("result")
-            error = parsed.get("error") or {}
-            raise BridgeError(error.get("type", "error"),
-                              error.get("message", "The operation failed."),
-                              error.get("detail"))
-
-        raise BridgeUnavailable(
-            "{0}\n\nUnderlying error: {1}: {2}".format(
-                NOT_RUNNING_HELP.format(path=info_file_path()),
-                type(last_exc).__name__, last_exc))
+        status, parsed = self._post(op, body, timeout)
+        if parsed.get("ok"):
+            return parsed.get("result")
+        error = parsed.get("error") or {}
+        raise BridgeError(error.get("type", "error"),
+                          error.get("message", "The operation failed."),
+                          error.get("detail"))
 
     def health(self):
         with self._lock:
@@ -193,11 +271,11 @@ class BridgeClient:
         try:
             status, parsed = self._request("GET", "/health", None,
                                            HEALTH_TIMEOUT, info)
-        except OSError as exc:
+        except _TransportFailure as failure:
             raise BridgeUnavailable(
                 "{0}\n\nUnderlying error: {1}: {2}".format(
                     NOT_RUNNING_HELP.format(path=info_file_path()),
-                    type(exc).__name__, exc))
+                    type(failure.cause).__name__, failure.cause))
         if status != 200 or not parsed.get("ok"):
             raise BridgeUnavailable(
                 "The bridge answered HTTP {0}: {1}".format(status, parsed))
@@ -354,7 +432,10 @@ TOOLS = [
          op="document_info"),
 
     tool("create_document",
-         "Create a new document and open it in a Krita view.",
+         "Create a new document. It opens in a Krita view unless `view` is "
+         "false, which keeps it off the canvas -- the mode for long scripted "
+         "work, and the one that survives Krita's OpenGL crashes (see the "
+         "README's crash note).",
          {"width": {"type": "integer"},
           "height": {"type": "integer"},
           "name": {"type": "string", "default": "Untitled"},
@@ -366,12 +447,18 @@ TOOLS = [
           "color_profile": {"type": "string", "default": "",
                             "description": "Empty for Krita's default."},
           "background": {"type": ["string", "array"],
-                         "description": "Optional fill colour, e.g. #ffffff."}},
+                         "description": "Optional fill colour, e.g. #ffffff."},
+          "view": {"type": "boolean", "default": True,
+                   "description": "false keeps the document off the canvas; "
+                                  "`views` in status reports the result."}},
          required=["width", "height"]),
 
     tool("open_document",
-         "Open an image file from disk in Krita.",
-         {"path": {"type": "string", "description": "Absolute path."}},
+         "Open an image file from disk in Krita. `view` works as it does for "
+         "create_document.",
+         {"path": {"type": "string", "description": "Absolute path."},
+          "view": {"type": "boolean", "default": True,
+                   "description": "false keeps the document off the canvas."}},
          required=["path"]),
 
     tool("save_document",
@@ -391,11 +478,10 @@ TOOLS = [
 
     tool("close_document",
          "Close a document. Refuses to discard unsaved work unless you say "
-         "so. CAUTION: Krita 5.3.3 has a bug where tearing down a "
-         "heavily-edited document sometimes crashes Krita itself (roughly one "
-         "close in five after a long editing session; it happens through "
-         "Krita's own File > Close too, and saving first does not help). "
-         "Prefer leaving documents open and letting the user close them.",
+         "so. CAUTION: Krita can crash while tearing down a heavily-edited "
+         "document (upstream reports roughly one close in five after a long "
+         "editing session; saving first does not help). Prefer leaving "
+         "documents open and letting the user close them.",
          {"document": DOCUMENT_PROP,
           "save": {"type": "boolean", "default": False},
           "discard_changes": {"type": "boolean", "default": False}}),

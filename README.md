@@ -215,8 +215,16 @@ loopback only and requires that token, so a web page can't drive your Krita.
 **The GUI-thread rule.** libkis isn't thread-safe. The HTTP server answers on
 worker threads, so every Krita call is marshalled to Krita's GUI thread through
 a queued Qt signal and waited on with a deadline. If Krita's UI is blocked — a
-modal dialog, a long filter — you get a clean `krita_busy` error at the
-deadline instead of a hung tool call. **Requests never hang.**
+modal dialog, a long filter — the wait ends with a clean error instead of a
+hung tool call: `krita_busy` when the operation was cancelled before it started
+(it did not run), or `outcome_unknown` when it had already begun and may still
+finish. **Requests never hang; an operation can still be in flight.**
+
+**A lost answer is never replayed.** If the connection breaks after a request
+was sent, the client cannot know whether the operation ran, so it reports
+`outcome_unknown` and leaves the decision to you rather than sending it again.
+A refused connection — Krita restarted onto a new port, say — is retried once
+against the discovery file, because nothing was sent the first time.
 
 ## Things worth knowing
 
@@ -230,26 +238,45 @@ composite ops and accepts any string, silently rendering unknown ids as Normal.
 `set_layer` canonicalises the ids it knows and warns on anything else, so a typo
 is visible rather than silent.
 
+**Scripted documents can stay off the canvas.** `create_document` and
+`open_document` take `view: false` to keep a document out of Krita's windows.
+That is the mode for long automated runs: nothing repaints and the document
+never enters the canvas/OpenGL path where the geometry operations crash (see
+*Known issue*). `status` and `inspect_document` report a `views` count, so a
+caller can confirm which mode it got. The default stays `view: true` — a
+visible document is what makes "watch the agent paint" work.
+
 **Direct pixel access needs RGBA/8-bit.** `draw`, `get_pixel` and per-layer
 `get_image` refuse other colour spaces with a clear message. The merged
 `get_image` works regardless.
 
-## Known issue: closing documents can crash Krita
+## Known issue: Krita can crash under sustained scripting
 
-`close_document` occasionally takes Krita down — roughly one close in five at
-the end of a long editing session. A freshly created or lightly edited document
-closes reliably.
+Two native faults are on record on macOS, both inside Krita's C++, neither
+reachable from plugin code:
 
-The fault is inside Krita's own C++ teardown, after `Document.close()` has
-returned. It reproduces identically through Krita's own *File → Close*, so it
-isn't caused by using libkis and isn't something a plugin can prevent. Tried and
-ruled out: draining the image scheduler, disabling autosave, clearing the
-modified flag, forcing a GC, pumping the event loop, closing views first, and
-saving before closing — that last one is the intuitive fix and it doesn't help.
+**Geometry on a viewed document.** `scale`, `rotate`, `crop` and friends run
+back to back on a document that is on a canvas abort Krita in its OpenGL tile
+cache (`ASSERT: "m_textureTiles.size() > tile"`,
+`libs/ui/opengl/kis_opengl_image_textures.h`). Measured on Krita 5.3.4: 7 of 7
+view-attached soak runs died after 1–9 iterations, while documents created with
+`view: false` survived 3 × 30 iterations of the same workload. Off-canvas is
+the mode for long scripted work; it is a mitigation, not a fix — the projection
+refresh after every mutation is still unproven.
 
-**Prefer leaving documents open and closing them yourself in Krita.** The tool
-description tells Claude the same. If Krita does die, nothing hangs: the next
-call returns a clear "could not reach Krita" message.
+**Closing a long-edited document.** `close_document` occasionally takes Krita
+down after `Document.close()` has returned — upstream's "roughly one close in
+five at the end of a long editing session"; a freshly created or lightly edited
+document closes reliably. Tried and ruled out: draining the image scheduler,
+disabling autosave, clearing the modified flag, forcing a GC, pumping the event
+loop, closing views first, and saving before closing — that last one is the
+intuitive fix and it doesn't help. Whether this is the same fault as Krita's own
+*File → Close* was never reproduced by hand, so treat that claim as unverified.
+
+**Prefer closing documents yourself, and keep long automation off a canvas.**
+If Krita does die, nothing hangs: the next call reports "could not reach Krita",
+and an operation that was in flight comes back as `outcome_unknown` rather than
+being replayed.
 
 ## Troubleshooting
 
@@ -289,6 +316,37 @@ python example_banner.py           # paint this README's banner
 covers the whole chain: protocol handshake, tool schemas, every tool against a
 live Krita, pixel-exact drawing results, and the error paths. It cleans up after
 itself.
+
+Krita-free unit suites cover the parts that can be tested without a running
+Krita — the HTTP client's failure handling, the GUI-thread hand-off and the
+soak's own evidence handling:
+
+```bash
+python test_transport.py       # a lost answer is never replayed
+python test_mainthread.py      # a job that missed its deadline is cancelled
+python test_stress_close.py    # trace/crash evidence parsing
+python test_gate.py            # the Python gate policy
+```
+
+### Soak testing
+
+`stress_close.py` loops a heavy workload (draw, filter, geometry, save, export,
+open, close) and reports what each iteration did. The default strategy closes
+through the bridge and needs no Python opt-in:
+
+```bash
+python stress_close.py op 30                    # 30 iterations, view-attached
+STRESS_VIEW=0 python stress_close.py op 30      # same, off-canvas documents
+STRESS_GROUPS=restack,errors,reads,python python stress_close.py deferred 8
+```
+
+Every run ends with a `RESULT` line holding the run as JSON: per-iteration
+outcomes, operation counts, new crash reports and the operation the trace log
+left unfinished. Exit codes: 0 survived, 2 Krita died, 3 an operation failed,
+4 the Python gate is closed, 5 the bridge was unreachable, 6 Krita had other
+documents open (a crash would take them with it; `STRESS_ALLOW_OPEN_DOCS=1`
+overrides that refusal). Keep the output: "no new crash report" is not the same
+as "no crash", because macOS does not always write one.
 
 Diagnostics:
 
