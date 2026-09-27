@@ -124,8 +124,8 @@ class KritaMcpExtension(Extension):
 
     def _on_status(self):
         if self._bridge is not None and self._bridge.running:
-            # GUI thread: re-read the gate before showing it.
-            exec_enabled = ops.python_exec_enabled()
+            # GUI thread: refresh the setting half before describing the gate.
+            ops.python_exec_enabled()
             body = (
                 "Running on http://127.0.0.1:{0}\n"
                 "Operations: {1}\n"
@@ -133,7 +133,7 @@ class KritaMcpExtension(Extension):
                 "Plugin version: {3}\n\n"
                 "Connection details for the MCP server are in:\n{4}"
             ).format(self._bridge.port, len(ops.advertised_operations()),
-                     "enabled" if exec_enabled else "disabled",
+                     ops.exec_gate_summary(),
                      ops.PLUGIN_VERSION, info_file_path())
         else:
             body = "Not running."

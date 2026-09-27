@@ -331,14 +331,18 @@ class GateFreshnessTest(unittest.TestCase):
 class GateSourceTest(unittest.TestCase):
     """S3: the operator must see why the gate is open, not just that it is."""
 
-    @unittest.expectedFailure
     def test_summary_names_the_source(self):
         summary = getattr(gate, "summary", None)
         self.assertIsNotNone(summary, "gate.summary is missing")
+        # decision() only pairs enabled with a configured switch, so these are
+        # the states the status dialog can actually show.
         self.assertEqual(summary(True, "env"), "enabled (environment)")
         self.assertEqual(summary(True, "setting"), "enabled (kritarc)")
-        self.assertEqual(summary(True, "default"), "enabled")
         self.assertEqual(summary(False, "setting"), "disabled")
+        self.assertEqual(summary(False, "env"), "disabled")
+        self.assertEqual(summary(False, "default"), "disabled")
+        self.assertEqual(summary(False, "unavailable"),
+                         "disabled (could not be read from this thread)")
 
     def test_source_follows_the_deciding_switch(self):
         instance = gate.Gate(read_setting=lambda: "true")

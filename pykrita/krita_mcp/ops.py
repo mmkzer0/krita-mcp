@@ -42,7 +42,7 @@ from .compat import (
 )
 
 from . import imaging
-from .gate import ENV_VAR, Gate, SETTING_KEY, UNSET, runs_code
+from .gate import ENV_VAR, Gate, SETTING_KEY, UNSET, runs_code, summary
 from .imaging import ImagingError, parse_color
 
 PLUGIN_VERSION = "1.0.0"
@@ -148,6 +148,11 @@ def advertised_operations():
     always re-checked when a gated operation is called.
     """
     return _GATE.advertised(OPS)
+
+
+def exec_gate_summary():
+    """One line describing the gate for the status dialog (any thread)."""
+    return summary(*_GATE.state())
 
 
 def _arg(params, key, default=None):

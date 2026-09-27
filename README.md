@@ -160,7 +160,8 @@ be overridden by an environment variable left over in a shell profile, and
 `KRITA_MCP_ALLOW_PYTHON=0` still forces one session off. Enabling takes an
 explicit "on" in one of the two. `/health` leaves the operation out of the list
 it reports while it is off, and *Tools → Scripts → MCP Bridge Status…* names the
-state outright.
+state and which switch decided it (`enabled (environment)`, `enabled (kritarc)`,
+or `disabled`).
 
 While the gate is closed, `trigger_action` additionally refuses the action ids
 that run scripts on a stock Krita (`execute_script_1..10`, `ten_scripts`,

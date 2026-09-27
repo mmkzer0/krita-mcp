@@ -50,6 +50,23 @@ def runs_code(action_name):
             or action_name.startswith(SCRIPT_ACTION_PREFIXES))
 
 
+_SOURCE_LABELS = {"env": "environment", "setting": "kritarc"}
+
+
+def summary(enabled, source):
+    """One line for the operator: whether the gate is open, and where from.
+
+    The source matters because both switches are easy to leave behind: an
+    exported variable in a shell profile, or a key in kritarc that nobody
+    remembers writing.
+    """
+    if not enabled:
+        if source == "unavailable":
+            return "disabled (could not be read from this thread)"
+        return "disabled"
+    return "enabled ({0})".format(_SOURCE_LABELS.get(source, source))
+
+
 def decision(setting_value, env_value):
     """Resolve the two switches into (enabled, source of truth).
 
