@@ -53,6 +53,26 @@ PLUGIN_VERSION = "1.0.0"
 # so those edits are refused unless this is set to 1.
 VIEWED_GEOMETRY_ENV = "KRITA_MCP_ALLOW_VIEWED_GEOMETRY"
 
+# Krita's layer-docker node model keeps its own update queue and drains it from
+# a coalescing timer (KisSignalCompressor(100, FIRST_ACTIVE) in
+# libs/ui/kis_node_model.cpp), so work queued while an operation ran is only
+# delivered on a later event-loop turn. Closing a document inside that window
+# leaves queue entries pointing at dummies the teardown is about to destroy,
+# which is the fault _settle_before_close exists to prevent.
+NODE_MODEL_TICK_SECONDS = 0.1
+
+# Seconds spent draining the GUI event loop before Document.close(), and after
+# it. KRITA_MCP_CLOSE_SETTLE_S overrides the first one; 0 turns it off, which
+# is what makes the live A/B measurable. 0.3 s already cleared three
+# consecutive integration runs, but one run under a different launch path still
+# died, so the default covers the slow tail of that queued work; even a second
+# is short next to a document close.
+CLOSE_SETTLE_ENV = "KRITA_MCP_CLOSE_SETTLE_S"
+CLOSE_SETTLE_SECONDS = 1.0
+# A close must never wedge the bridge, and the operation's own deadline is 60 s.
+CLOSE_SETTLE_MAX_SECONDS = 10.0
+CLOSE_PUMP_SECONDS = 0.6
+
 # Owned here; extension.py imports it so the gate and the settings reader
 # cannot drift apart (Krita reads [krita_mcp] from kritarc).
 SETTINGS_GROUP = "krita_mcp"
@@ -623,14 +643,8 @@ def _trace(text):
         pass
 
 
-def _settle_after_close(budget=0.6):
-    """Let Krita finish retiring a document before we answer the client.
-
-    Document.close() only starts the teardown: views are dropped with
-    deleteLater() and the document is retired from Krita's part list through
-    the event loop. Until that finishes, Krita.documents() still hands back
-    the dead document, and the next request -- which arrives a few
-    milliseconds later -- reads freed memory and takes the process down.
+def _drain_event_loop(budget):
+    """Run Krita's own event loop for a bounded window.
 
     Dispatching DeferredDelete alone is not enough; measured over repeated
     runs, the teardown needs real event-loop time. The bridge's own queued
@@ -648,6 +662,61 @@ def _settle_after_close(budget=0.6):
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
         time.sleep(0.01)
     gc.collect()
+
+
+def _settle_after_close(budget=CLOSE_PUMP_SECONDS):
+    """Let Krita finish retiring a document before we answer the client.
+
+    Document.close() only starts the teardown: views are dropped with
+    deleteLater() and the document is retired from Krita's part list through
+    the event loop. Until that finishes, Krita.documents() still hands back
+    the dead document, and the next request -- which arrives a few
+    milliseconds later -- reads freed memory and takes the process down.
+    """
+    _drain_event_loop(budget)
+
+
+def _close_settle_budget():
+    """Seconds to drain before Document.close(); 0 keeps the drain off.
+
+    A value outside [0, CLOSE_SETTLE_MAX_SECONDS] falls back to the default --
+    including a negative or non-finite one, so a typo can neither hang the GUI
+    thread nor silently switch the drain off.
+    """
+    raw = os.environ.get(CLOSE_SETTLE_ENV)
+    if raw is None:
+        return CLOSE_SETTLE_SECONDS
+    try:
+        seconds = float(raw)
+    except ValueError:
+        seconds = -1.0
+    # NaN fails both comparisons, which is why the range test alone is enough.
+    if not 0.0 <= seconds <= CLOSE_SETTLE_MAX_SECONDS:
+        _trace("close: {0}={1!r} is not a usable budget, using {2}s".format(
+            CLOSE_SETTLE_ENV, raw, CLOSE_SETTLE_SECONDS))
+        return CLOSE_SETTLE_SECONDS
+    return seconds
+
+
+def _settle_before_close():
+    """Drain the work Krita has queued for the GUI thread, before teardown.
+
+    The layer docker's KisNodeModel queues raw KisNodeDummy pointers and hands
+    them to its own update converter from a coalescing timer. Nothing clears
+    that queue when a document's dummies are destroyed, so an entry still
+    pending at Document.close() is dereferenced afterwards -- measured as a
+    crash in KisNodeDummy::parent(), called from
+    KisNodeModel::processUpdateQueue, while this plugin's post-close pump ran
+    the event loop (crash report 2026-09-26 21:21:06). Draining a few node
+    model ticks while the document is still whole leaves the queue empty
+    before anything is torn down.
+    """
+    budget = _close_settle_budget()
+    if budget <= 0:
+        _trace("close: pre-close drain off ({0}=0)".format(CLOSE_SETTLE_ENV))
+        return
+    _trace("close: draining queued view work for {0:.2f}s".format(budget))
+    _drain_event_loop(budget)
 
 
 def _describe(doc, node):
@@ -924,10 +993,17 @@ def op_close_document(params):
         if not doc.fileName():
             raise OpError("Cannot save before closing: the document has no "
                           "file name. Call save_document with a path first.")
+        previous_batchmode = doc.batchmode()
         doc.setBatchmode(True)
-        if not doc.save():
-            raise OpError("Saving failed, so the document was left open.")
-        doc.waitForDone()
+        try:
+            if not doc.save():
+                raise OpError("Saving failed, so the document was left open.")
+            doc.waitForDone()
+        finally:
+            # The drain below wants the document in its normal state: batch
+            # mode suppresses Krita's own view updates, and those are exactly
+            # what has to be flushed while the document is still whole.
+            doc.setBatchmode(previous_batchmode)
     elif doc.modified():
         if not _as_bool(_arg(params, "discard_changes", False), "discard_changes"):
             raise OpError(
@@ -935,6 +1011,7 @@ def op_close_document(params):
                 "discard_changes=true to throw them away."
                 .format(summary["name"]), kind="unsaved_changes")
 
+    _settle_before_close()
     _trace("close: about to close {0!r}".format(summary["name"]))
     doc.setBatchmode(True)
     # Document.close() closes the document's views, and a view whose document
@@ -965,15 +1042,14 @@ def op_close_document(params):
     # at some arbitrary later point when its C++ object is already gone.
     gc.collect()
 
-    # KNOWN KRITA DEFECT (5.3.3): tearing a document down occasionally faults
-    # inside Krita's own C++ teardown, taking the process with it. Measured at
-    # roughly one close in five at the end of a long editing session; a clean
-    # document closes reliably. It reproduces identically through Krita's own
-    # File > Close action, so it is not an artefact of using libkis, and
-    # nothing available from a plugin prevents it -- draining the scheduler,
-    # disabling autosave, clearing the modified flag, collecting stale
-    # wrappers and pumping the event loop were all tried and none of them
-    # removes it. Everything above narrows the window; see README.md.
+    # Krita's own teardown is what faults: the layer docker's node model keeps
+    # a queue of raw KisNodeDummy pointers and drains it from a coalescing
+    # timer, and nothing clears that queue when this document's dummies die.
+    # The drain above empties it while the document is whole; the pump after
+    # the close is what used to deliver it against freed memory. Draining the
+    # image scheduler, disabling autosave, clearing the modified flag,
+    # collecting stale wrappers, saving first and pumping *after* the close
+    # were all tried and none of them removed the fault.
     _trace("close: calling Document.close()")
     doc.close()
     _trace("close: close call returned")

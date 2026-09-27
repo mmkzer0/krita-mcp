@@ -254,8 +254,9 @@ work.
 
 ## Known issue: Krita can crash under sustained scripting
 
-Two native faults are on record on macOS, both inside Krita's C++, neither
-reachable from plugin code.
+Two native faults are on record on macOS, both inside Krita's C++. The first is
+refused on the operations that reach it; the second is drained around before
+the teardown that would run it.
 
 **A viewed document must not change size.** `resize_canvas`, `scale`, `rotate`
 and `crop` on a document that is on a canvas can abort Krita in its OpenGL tile
@@ -292,17 +293,28 @@ on this build (measured: idle death after 10s with batch mode off, no death in
 120s with it on), which is why `create_document` and `open_document` leave
 batch mode on for a viewed document.
 
-**Closing a long-edited document.** `close_document` occasionally takes Krita
-down after `Document.close()` has returned — upstream's "roughly one close in
-five at the end of a long editing session"; a freshly created or lightly edited
-document closes reliably. Today's reproduction (2026-09-27, trace shows
-`close: close call returned` and nothing after it, in the settle that follows):
-a 400×300 document that had been open for about a minute. Tried and ruled out:
-draining the image scheduler, disabling autosave, clearing the modified flag,
-forcing a GC, pumping the event loop, closing views first, and saving before
-closing — that last one is the intuitive fix and it doesn't help. Whether this
-is the same fault as Krita's own *File → Close* was never reproduced by hand,
-so treat that claim as unverified.
+**Closing a long-edited document.** `close_document` used to take Krita down
+after `Document.close()` had returned, inside the settle that follows it. The
+crash report for that event (2026-09-26 21:21:06) points at Krita's layer
+docker: `KisNodeModel` queues raw `KisNodeDummy` pointers and hands them to its
+index converter from a 100 ms coalescing timer, and nothing clears that queue
+when the document's dummies are destroyed.
+
+```
+KisNodeDummy::parent()
+  <- KisModelIndexConverter::indexFromDummy
+  <- KisNodeModel::processUpdateQueue        (timer tick, after the teardown)
+```
+
+Draining the event loop *before* `Document.close()` lets that queued work run
+while the document is still whole, and that is what `close_document` does now
+(`KRITA_MCP_CLOSE_SETTLE_S` sets the budget in seconds, default 1; `0` turns it
+off). Measured on this host with one build and only that switch changed: with
+the drain off, three integration runs each ended in the final close with Krita
+gone (`SIGSEGV`, exit status 139); with it on, five further runs completed
+(`84 passed, 0 failed, 1 skipped`) and Krita stayed up. The document's age is
+*not* the variable — a probe closing documents after 0, 5, 15 and 60 seconds of
+the same work, viewed and view-less, closed all 24 of them cleanly.
 
 **Prefer closing documents yourself, and keep long automation off a canvas.**
 If Krita does die, nothing hangs: the next call reports "could not reach Krita",
@@ -332,6 +344,11 @@ open the document with `view: false`, or start Krita with
 opt-in*). A model seeing this wants both switches: `--enable-exec` on the MCP
 server and `allow_python=true` in `kritarc` (or `KRITA_MCP_ALLOW_PYTHON=1`
 before Krita starts).
+
+**A `close_document` call takes about a second** — that is the drain described
+under *Known issue*, and it is the point of it. `KRITA_MCP_CLOSE_SETTLE_S=0.3`
+shortens the wait; `0` turns the drain off, which is how the crash it prevents
+was isolated.
 
 **Something crashed and you want to know why** — set `KRITA_MCP_TRACE=1` before
 starting Krita to log every operation to `krita_mcp_trace.log` in Krita's data
