@@ -168,6 +168,13 @@ that run scripts on a stock Krita (`execute_script_1..10`, `ten_scripts`,
 list as a guard, not a sandbox: a plugin you install can register its own
 script runner and the bridge cannot see it.
 
+**Which half does what.** `--enable-exec` governs the model-facing surface: the
+tool is not advertised without it, and a call is refused before any request
+leaves the MCP server. The plugin setting is the enforcement point: the bridge
+refuses the operation itself, so it also covers `mcp_server.py --call` and
+anything else that speaks HTTP to the loopback port with the token. Neither
+switch is a sandbox.
+
 What the gate is *not*: it does not contain a process that can already read
 `krita_mcp_bridge.json`, and it does not restrict file paths — `open_document`,
 `save_document` and `export_document` still reach anything you can. Connect only
