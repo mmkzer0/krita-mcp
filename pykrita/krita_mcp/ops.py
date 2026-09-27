@@ -111,13 +111,12 @@ def _log(text):
 def _read_allow_python():
     """Read [krita_mcp] allow_python through libkis. GUI thread only.
 
-    Unreadable settings come back as UNSET ("never configured"), which the
-    gate resolves to disabled: fail closed.
+    A failed read is left to the gate, which marks itself unavailable and
+    treats run_python as disabled. Answering UNSET here would claim the key was
+    never configured, and the environment override would then open a gate that
+    the operator's kritarc setting may have closed.
     """
-    try:
-        return _krita().readSetting(SETTINGS_GROUP, SETTING_KEY, UNSET)
-    except Exception:
-        return UNSET
+    return _krita().readSetting(SETTINGS_GROUP, SETTING_KEY, UNSET)
 
 
 _GATE = Gate(read_setting=_read_allow_python)

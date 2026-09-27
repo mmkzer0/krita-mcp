@@ -129,7 +129,14 @@ class Gate:
     def refresh(self):
         """Re-read the setting and return the decision. Owner thread only."""
         self.assert_owner_thread()
-        self._setting = self._read_setting()
+        try:
+            self._setting = self._read_setting()
+        except Exception:
+            # Keep the last good value for the next successful refresh, but do
+            # not let it answer for a setting that could not be read: the
+            # unreadable kritarc may say "false".
+            self._unavailable = True
+            raise
         self._unavailable = False
         return self.state()[0]
 

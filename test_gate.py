@@ -116,10 +116,12 @@ class GateDecisionSourceTest(unittest.TestCase):
             raise RuntimeError("settings unreadable")
 
         self.gate = gate.Gate(read_setting=explode)
-        with self.assertRaises(RuntimeError):
-            self.gate.refresh()
-        self.assertFalse(self.gate.enabled,
-                         "an unreadable setting must leave the gate closed")
+        with mock.patch.dict(os.environ, {gate.ENV_VAR: "1"}):
+            with self.assertRaises(RuntimeError):
+                self.gate.refresh()
+            self.assertFalse(self.gate.enabled,
+                             "an unreadable setting must leave the gate closed")
+            self.assertEqual(self.gate.source, "unavailable")
 
 
 class ScriptActionGuardTest(unittest.TestCase):
@@ -144,6 +146,10 @@ class GateThreadingTest(unittest.TestCase):
     def setUp(self):
         self.reads = []
         self.gate = gate.Gate(read_setting=self._read)
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(gate.ENV_VAR, None)
 
     def _read(self):
         self.reads.append(1)
@@ -341,6 +347,64 @@ class GateFreshnessTest(unittest.TestCase):
         instance = gate.Gate(read_setting=lambda: "true")
         with mock.patch.dict(os.environ, {gate.ENV_VAR: "0"}):
             self.assertFalse(instance.enabled)
+
+
+class ReaderFailureTest(unittest.TestCase):
+    """F16: a failed settings read closes the gate, whatever the environment.
+
+    ops._read_allow_python used to answer UNSET when libkis raised, which means
+    "never configured" -- and an exported KRITA_MCP_ALLOW_PYTHON=1 then opened a
+    gate whose kritarc setting may have said false. The adapter must report the
+    gate unavailable instead: closed, hide run_python, and leave the rest of the
+    bridge alone.
+    """
+
+    @staticmethod
+    def _unreadable():
+        def explode():
+            raise RuntimeError("settings unreadable")
+
+        return gate.Gate(read_setting=explode)
+
+    def test_an_unreadable_setting_never_opens_the_gate(self):
+        instance = self._unreadable()
+        with mock.patch.dict(os.environ, {gate.ENV_VAR: "1"}):
+            self.assertFalse(instance.refresh_or_closed(),
+                             "a failed read must not be read as 'allowed'")
+            self.assertFalse(instance.enabled)
+            self.assertEqual(instance.source, "unavailable")
+
+    def test_an_unreadable_setting_hides_the_gated_operation(self):
+        instance = self._unreadable()
+        with mock.patch.dict(os.environ, {gate.ENV_VAR: "1"}):
+            instance.refresh_or_closed()
+            self.assertEqual(instance.advertised(("status", "run_python")),
+                             ["status"])
+
+    def test_the_refusal_is_logged_once_with_its_cause(self):
+        instance = self._unreadable()
+        logs = []
+        instance.refresh_or_closed(log=logs.append)
+        self.assertEqual(len(logs), 1)
+        self.assertIn("settings unreadable", logs[0])
+
+    def test_a_later_readable_setting_opens_the_gate_again(self):
+        reads = []
+
+        def reader():
+            reads.append(1)
+            if len(reads) == 1:
+                raise RuntimeError("first read fails")
+            return "true"
+
+        instance = gate.Gate(read_setting=reader)
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(gate.ENV_VAR, None)
+        self.assertFalse(instance.refresh_or_closed())
+        self.assertTrue(instance.refresh_or_closed(), "the next read decides")
+        self.assertEqual(instance.source, "setting")
 
 
 class GateSourceTest(unittest.TestCase):
