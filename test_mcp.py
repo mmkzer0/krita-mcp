@@ -165,6 +165,11 @@ def _text_of(result):
     return ""
 
 
+def names_both_switches(text):
+    """Both halves must tell the operator which switches gate the operation."""
+    return "--enable-exec" in text and "allow_python" in text
+
+
 def is_plugin_gated(failure_text):
     """Did Krita's own gate refuse the call, rather than the MCP server?
 
@@ -687,7 +692,7 @@ def exec_gate_section(client, names):
         # The two halves keep their own wording, so pin the contract the text
         # has to satisfy rather than the wording itself.
         check("server refusal names both switches",
-              "--enable-exec" in text and "allow_python" in text, text[:200])
+              names_both_switches(text), text[:200])
     finally:
         plain.close()
 
@@ -711,8 +716,7 @@ def escape_hatch_section(client, doc_name):
                  "(plugin gate closed: launch Krita with "
                  "KRITA_MCP_ALLOW_PYTHON=1 to exercise them)")
             check("plugin refusal names both switches",
-                  "--enable-exec" in failure and "allow_python" in failure,
-                  failure[:200])
+                  names_both_switches(failure), failure[:200])
             # While the gate is closed, the ungated escape hatch must not be a
             # way around it. Ten Scripts may be absent, in which case there is
             # nothing to guard.
