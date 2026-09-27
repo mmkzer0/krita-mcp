@@ -238,30 +238,7 @@ def main():
               reply.get("result") == {}, str(reply)[:200])
 
         # ---------------------------------------------------------------
-        section("exec gate (server side)")
-        check("run_python listed when --enable-exec is on",
-              "run_python" in names, str(sorted(names)))
-
-        plain = Client()
-        try:
-            plain.request("initialize", {"protocolVersion": PROTOCOL,
-                                         "capabilities": {},
-                                         "clientInfo": {"name": "gate-check",
-                                                        "version": "1.0"}},
-                          timeout=30)
-            plain.notify("notifications/initialized")
-            plain_tools = plain.request("tools/list", {}, timeout=15).get(
-                "result", {}).get("tools", [])
-            plain_names = {t["name"] for t in plain_tools}
-            check("run_python hidden without --enable-exec",
-                  "run_python" not in plain_names, str(sorted(plain_names)))
-            refused = plain.call("run_python", {"code": "1 + 1"}, timeout=30)
-            text = _text_of(refused)
-            check("gated call refused before it reaches Krita",
-                  refused.get("isError") is True
-                  and text.startswith("exec_disabled"), text[:200])
-        finally:
-            plain.close()
+        exec_gate_section(client, names)
 
         # ---------------------------------------------------------------
         section("connection and status")
@@ -509,63 +486,8 @@ def main():
         check("selection cleared", sel.get("selection") is None, str(sel))
 
         # ---------------------------------------------------------------
-        section("escape hatches")
-        # The plugin has its own gate (allow_python / KRITA_MCP_ALLOW_PYTHON);
-        # a default Krita refuses this before the checks below can run, so
-        # report that configuration as a skip rather than a failure.
-        raw = client.call("run_python", {
-            "code": "print('hello from krita')\n"
-                    "result = {'docs': len(krita.documents())}"})
-        if raw.get("isError"):
-            failure = _text_of(raw)
-            if is_plugin_gated(failure):
-                skip("run_python and its error-path checks",
-                     "(plugin gate closed: launch Krita with "
-                     "KRITA_MCP_ALLOW_PYTHON=1 to exercise them)")
-                # While the gate is closed, the ungated escape hatch must not
-                # be a way around it. Ten Scripts may be absent, in which case
-                # there is nothing to guard.
-                refused = client.call("trigger_action",
-                                      {"name": "execute_script_1"})
-                text = _text_of(refused)
-                check("script-running action refused while gated",
-                      refused.get("isError") is True
-                      and ("runs a Python script" in text
-                           or "no action named" in text), text[:160])
-                got, _ = client.ok("trigger_action", {"name": "edit_undo"})
-                check("non-script actions still work while gated",
-                      got.get("triggered") == "edit_undo", str(got)[:160])
-            else:
-                raise AssertionError("run_python failed: " + failure)
-        else:
-            got = json.loads(_text_of(raw))
-            check("run_python executed", got.get("ok") is True, str(got)[:300])
-            check("run_python captured stdout",
-                  "hello from krita" in got.get("stdout", ""),
-                  str(got.get("stdout")))
-            check("run_python returned a value",
-                  isinstance(got.get("result", {}).get("docs"), int), str(got))
-
-            raw = client.call("run_python",
-                              {"code": "raise ValueError('boom')"})
-            got = json.loads(_text_of(raw))
-            check("run_python reports errors without killing the bridge",
-                  got.get("ok") is False
-                  and "boom" in got.get("exception", ""),
-                  str(got)[:200])
-
-        client.ok("set_selection", {"document": doc_name, "mode": "rect",
-                                    "x": 0, "y": 0, "width": 20, "height": 20})
-        got, _ = client.ok("trigger_action", {"name": "deselect"})
-        check("trigger_action fired", got.get("triggered") == "deselect",
-              str(got))
-        info, _ = client.ok("inspect_document", {"document": doc_name})
-        check("triggered action took effect",
-              info.get("selection") is None, str(info.get("selection")))
-
-        result = client.call("trigger_action", {"name": "no_such_action_id"})
-        check("unknown action rejected", result.get("isError") is True,
-              _text_of(result)[:120])
+        escape_hatch_section(client, doc_name)
+        trigger_action_section(client, doc_name)
 
         # ---------------------------------------------------------------
         section("geometry")
@@ -732,6 +654,104 @@ def main():
         for line in client.stderr_lines[-40:]:
             print("  " + line)
     return 1 if FAIL else 0
+
+
+def exec_gate_section(client, names):
+    """A default server hides the gated tool and refuses it locally.
+
+    Runs a second MCP client without --enable-exec, so this proves the
+    advertising half of the gate without needing Krita.
+    """
+    section("exec gate (server side)")
+    check("run_python listed when --enable-exec is on",
+          "run_python" in names, str(sorted(names)))
+
+    plain = Client()
+    try:
+        plain.request("initialize", {"protocolVersion": PROTOCOL,
+                                     "capabilities": {},
+                                     "clientInfo": {"name": "gate-check",
+                                                    "version": "1.0"}},
+                      timeout=30)
+        plain.notify("notifications/initialized")
+        plain_tools = plain.request("tools/list", {}, timeout=15).get(
+            "result", {}).get("tools", [])
+        plain_names = {t["name"] for t in plain_tools}
+        check("run_python hidden without --enable-exec",
+              "run_python" not in plain_names, str(sorted(plain_names)))
+        refused = plain.call("run_python", {"code": "1 + 1"}, timeout=30)
+        text = _text_of(refused)
+        check("gated call refused before it reaches Krita",
+              refused.get("isError") is True
+              and text.startswith("exec_disabled"), text[:200])
+    finally:
+        plain.close()
+
+
+def escape_hatch_section(client, doc_name):
+    """run_python, plus the script-action guard that backs it up.
+
+    The plugin has its own gate (allow_python / KRITA_MCP_ALLOW_PYTHON), and a
+    default Krita refuses run_python before these checks can run: that
+    configuration is reported as a skip rather than a failure, and the guard
+    against script-running actions is checked while it is closed.
+    """
+    section("escape hatches")
+    raw = client.call("run_python", {
+        "code": "print('hello from krita')\n"
+                "result = {'docs': len(krita.documents())}"})
+    if raw.get("isError"):
+        failure = _text_of(raw)
+        if is_plugin_gated(failure):
+            skip("run_python and its error-path checks",
+                 "(plugin gate closed: launch Krita with "
+                 "KRITA_MCP_ALLOW_PYTHON=1 to exercise them)")
+            # While the gate is closed, the ungated escape hatch must not be a
+            # way around it. Ten Scripts may be absent, in which case there is
+            # nothing to guard.
+            refused = client.call("trigger_action",
+                                  {"name": "execute_script_1"})
+            text = _text_of(refused)
+            check("script-running action refused while gated",
+                  refused.get("isError") is True
+                  and ("runs a Python script" in text
+                       or "no action named" in text), text[:160])
+            got, _ = client.ok("trigger_action", {"name": "edit_undo"})
+            check("non-script actions still work while gated",
+                  got.get("triggered") == "edit_undo", str(got)[:160])
+        else:
+            raise AssertionError("run_python failed: " + failure)
+    else:
+        got = json.loads(_text_of(raw))
+        check("run_python executed", got.get("ok") is True, str(got)[:300])
+        check("run_python captured stdout",
+              "hello from krita" in got.get("stdout", ""),
+              str(got.get("stdout")))
+        check("run_python returned a value",
+              isinstance(got.get("result", {}).get("docs"), int), str(got))
+
+        raw = client.call("run_python", {"code": "raise ValueError('boom')"})
+        got = json.loads(_text_of(raw))
+        check("run_python reports errors without killing the bridge",
+              got.get("ok") is False
+              and "boom" in got.get("exception", ""),
+              str(got)[:200])
+
+
+def trigger_action_section(client, doc_name):
+    """The escape hatch that does not need the Python gate: menu actions."""
+    client.ok("set_selection", {"document": doc_name, "mode": "rect",
+                                "x": 0, "y": 0, "width": 20, "height": 20})
+    got, _ = client.ok("trigger_action", {"name": "deselect"})
+    check("trigger_action fired", got.get("triggered") == "deselect",
+          str(got))
+    info, _ = client.ok("inspect_document", {"document": doc_name})
+    check("triggered action took effect",
+          info.get("selection") is None, str(info.get("selection")))
+
+    result = client.call("trigger_action", {"name": "no_such_action_id"})
+    check("unknown action rejected", result.get("isError") is True,
+          _text_of(result)[:120])
 
 
 def cleanup_section(client, doc_name):
