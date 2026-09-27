@@ -20,6 +20,7 @@ proves the script-action guard is actually consulted, and that a default
 install hides and refuses run_python end to end.
 """
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -30,12 +31,26 @@ from pathlib import Path
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE / "pykrita" / "krita_mcp"))
 
-import gate  # noqa: E402  (deliberate path setup above)
-import mcp_server  # noqa: E402
-import test_mcp  # noqa: E402
+
+def _load(name, path):
+    """Load a file by path under a private name.
+
+    The gate, the MCP server and the live harness are separate files rather
+    than a package. Importing them as top-level names would append this
+    directory and the plugin directory to sys.path and register generic names
+    like `gate` and `mcp_server` for every later test in the same process.
+    """
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+gate = _load("krita_gate_under_test", HERE / "pykrita" / "krita_mcp" / "gate.py")
+mcp_server = _load("krita_gate_mcp_server", HERE / "mcp_server.py")
+test_mcp = _load("krita_gate_harness", HERE / "test_mcp.py")
 
 
 class GatePolicyTest(unittest.TestCase):
@@ -360,17 +375,16 @@ class ImportHygieneTest(unittest.TestCase):
     bare names leaks both into every other test in the same process.
     """
 
-    @unittest.expectedFailure
     def test_import_leaves_sys_path_and_module_names_alone(self):
         probe = (
             "import importlib.util, json, sys\n"
             "before = list(sys.path)\n"
+            "names = ('gate', 'mcp_server', 'test_mcp')\n"
             "spec = importlib.util.spec_from_file_location('tg_probe', {path!r})\n"
             "module = importlib.util.module_from_spec(spec)\n"
             "spec.loader.exec_module(module)\n"
             "print(json.dumps({{'added': [p for p in sys.path if p not in before],\n"
-            "                   'bare': [n for n in ('gate', 'mcp_server', 'test_mcp')\n"
-            "                           if n in sys.modules]}}))\n"
+            "                   'bare': [n for n in names if n in sys.modules]}}))\n"
         ).format(path=str(HERE / "test_gate.py"))
         result = subprocess.run([sys.executable, "-c", probe],
                                 capture_output=True, text=True, cwd=str(HERE),
