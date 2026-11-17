@@ -623,9 +623,9 @@ TOOLS = [
          {"document": DOCUMENT_PROP,
           "name": {"type": "string", "default": "Layer"},
           "type": {"type": "string", "default": "paintlayer",
-                   "enum": ["paintlayer", "grouplayer", "filllayer",
-                            "filelayer", "clonelayer", "vectorlayer",
-                            "transparencymask", "selectionmask"]},
+                   "enum": ["paintlayer", "grouplayer", "filelayer",
+                            "vectorlayer", "transparencymask",
+                            "selectionmask"]},
           "parent": {"type": "string",
                      "description": "A group layer to nest inside (omit for "
                                     "the top level); for a mask, the layer "

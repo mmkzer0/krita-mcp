@@ -1157,10 +1157,9 @@ _LAYER_TYPES = {
     "grouplayer": "grouplayer",
     "group": "grouplayer",
     "filelayer": "filelayer",
-    # No "filterlayer": createNode() makes one without a filter, and a
-    # document holding it killed Krita 5.3.4 (exit 139, F28).
-    "filllayer": "filllayer",
-    "clonelayer": "clonelayer",
+    # No "filterlayer", "filllayer" or "clonelayer": createNode() makes them
+    # without a filter, generator or source, and saving a document holding
+    # one killed Krita 5.3.4 (exit 139 / 139 / 134, F28).
     "vectorlayer": "vectorlayer",
     # Filter, transform and colorize masks need configuration createNode()
     # cannot give them; transparency and selection masks are initialised by
