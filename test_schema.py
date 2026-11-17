@@ -410,6 +410,29 @@ class CallToolTest(unittest.TestCase):
         self.assertIn("blending_mode", message)
         self.bridge.assert_not_called()
 
+    def test_missing_plugin_operation_names_both_versions(self):
+        self.bridge.side_effect = mcp_server.BridgeError(
+            "unknown_op", "Unknown operation 'fill'.")
+        with mock.patch.object(mcp_server.BRIDGE, "health",
+                               return_value={"ok": True,
+                                             "plugin_version": "1.0.0"}):
+            with self.assertRaises(mcp_server.BridgeError) as caught:
+                mcp_server.call_tool("fill", {"color": "#ffffff"})
+        self.assertEqual(caught.exception.kind, "plugin_outdated")
+        message = str(caught.exception)
+        self.assertIn("'fill'", message)
+        self.assertIn("1.0.0", message)
+        self.assertIn(mcp_server.SERVER_VERSION, message)
+
+    def test_missing_operation_without_health_keeps_the_original(self):
+        self.bridge.side_effect = mcp_server.BridgeError(
+            "unknown_op", "Unknown operation 'fill'.")
+        with mock.patch.object(mcp_server.BRIDGE, "health",
+                               side_effect=mcp_server.BridgeUnavailable("x")):
+            with self.assertRaises(mcp_server.BridgeError) as caught:
+                mcp_server.call_tool("fill", {"color": "#ffffff"})
+        self.assertEqual(caught.exception.kind, "unknown_op")
+
     def test_every_error_is_on_its_own_line(self):
         with self.assertRaises(mcp_server.BridgeError) as caught:
             mcp_server.call_tool("create_document", {})

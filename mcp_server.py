@@ -1092,6 +1092,21 @@ def drop_optional_nulls(schema, value):
     return value
 
 
+def _version_skew(tool_name, op, original):
+    """The plugin lacks an operation this server advertises: say why."""
+    try:
+        plugin = BRIDGE.health().get("plugin_version") or "unknown"
+    except BridgeUnavailable:
+        return original
+    return BridgeError(
+        "plugin_outdated",
+        "{0} needs the Krita plugin operation {1!r}, which the running plugin "
+        "(version {2}) does not have; this MCP server is version {3}. Install "
+        "the plugin from the same checkout as this server (install.sh or "
+        "install.ps1) and restart Krita.".format(tool_name, op, plugin,
+                                                SERVER_VERSION))
+
+
 def call_tool(name, arguments, allow_exec=False):
     spec = TOOLS_BY_NAME.get(name)
     if spec is None:
@@ -1119,7 +1134,12 @@ def call_tool(name, arguments, allow_exec=False):
     if spec["_transform"] is not None:
         op, args = spec["_transform"](args)
 
-    result = BRIDGE.call(op, args)
+    try:
+        result = BRIDGE.call(op, args)
+    except BridgeError as exc:
+        if exc.kind == "unknown_op":
+            raise _version_skew(name, op, exc)
+        raise
 
     if spec["_image"] and isinstance(result, dict) and result.get("png_base64"):
         png = result.pop("png_base64")
