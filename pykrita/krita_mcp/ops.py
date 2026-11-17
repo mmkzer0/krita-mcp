@@ -2283,8 +2283,9 @@ def op_timeout(name, default=30.0):
 
 # Registered last, so a reload of this module re-registers them into the
 # fresh OPS together with everything above.
-from . import history_ops, paint_ops, vector_ops  # noqa: E402
+from . import history_ops, paint_ops, style_ops, vector_ops  # noqa: E402
 
 paint_ops.register(op)
 vector_ops.register(op)
 history_ops.register(op)
+style_ops.register(op)

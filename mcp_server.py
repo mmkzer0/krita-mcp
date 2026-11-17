@@ -471,6 +471,49 @@ STROKE = {
 }
 
 
+STYLE_COLOR = {"type": ["string", "array"],
+               "description": "#rgb, #rrggbb, an SVG colour name or [r,g,b]. "
+                              "No transparency: use `opacity`."}
+
+LAYER_STYLE = {
+    "stroke": {"type": "object", "additionalProperties": False,
+               "description": "Outline around the layer's pixels or text.",
+               "properties": {
+                   "size": {"type": "number", "minimum": 1, "maximum": 250,
+                            "description": "Width in canvas pixels."},
+                   "color": STYLE_COLOR,
+                   "position": {"type": "string",
+                                "enum": ["outside", "inside", "center"],
+                                "default": "outside"},
+                   "opacity": {"type": "number", "minimum": 0, "maximum": 1,
+                               "default": 1}},
+               "required": ["size", "color"]},
+    "drop_shadow": {"type": "object", "additionalProperties": False,
+                    "description": "Shadow behind the layer; {} gives the "
+                                   "defaults.",
+                    "properties": {
+                        "color": dict(STYLE_COLOR, description=(
+                            "Default black. " + STYLE_COLOR["description"])),
+                        "opacity": {"type": "number", "minimum": 0,
+                                    "maximum": 1, "default": 0.75},
+                        "angle": {"type": "number", "minimum": -180,
+                                  "maximum": 180, "default": 120,
+                                  "description": "Light direction in degrees; "
+                                                 "120 casts the shadow down "
+                                                 "and right."},
+                        "distance": {"type": "number", "minimum": 0,
+                                     "maximum": 30000, "default": 5,
+                                     "description": "Offset in canvas pixels."},
+                        "size": {"type": "number", "minimum": 0,
+                                 "maximum": 250, "default": 5,
+                                 "description": "Blur in canvas pixels."},
+                        "spread": {"type": "number", "minimum": 0,
+                                   "maximum": 100, "default": 0,
+                                   "description": "Percent."}}},
+    "clear": {"type": "boolean", "default": False,
+              "description": "Remove the style. Use alone."},
+}
+
 
 def tool(name, description, properties, required=None, op=None, image=False,
          transform=None, exec_required=False):
@@ -901,6 +944,26 @@ TOOLS = [
          {"document": DOCUMENT_PROP,
           "checkpoints": {"type": "array", "items": {"type": "string"},
                           "minItems": 1}}),
+
+    tool("set_layer_style",
+         "Give a layer an outline (stroke) and/or a drop shadow as a real "
+         "Krita layer style, editable later in Layer > Layer Style; for SFX "
+         "and lettering on paint or vector layers. The call sets the whole "
+         "style: an effect you leave out is off, and other effects the layer "
+         "had (bevel, glow, ...) are removed and listed in "
+         "`discarded_effects`. Krita stores whole numbers, so values are "
+         "rounded. Not covered by checkpoint/restore. Returns the style as "
+         "read back from the layer.",
+         dict({"document": DOCUMENT_PROP, "layer": LAYER_PROP},
+              **LAYER_STYLE),
+         required=["layer"]),
+
+    tool("get_layer_style",
+         "Read a layer's style: {has_style, stroke?, drop_shadow?, "
+         "other_effects} in the units set_layer_style takes; other_effects "
+         "names enabled effects these tools do not model.",
+         {"document": DOCUMENT_PROP, "layer": LAYER_PROP},
+         required=["layer"]),
 
     tool("list_capabilities",
          "List what this Krita build supports: filter names (with their "

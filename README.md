@@ -138,6 +138,7 @@ Restart the client. Krita must be running for the tools to do anything.
 | `set_selection` | rect / ellipse / polygon / magic wand / colour range / layer alpha, combine modes, grow / shrink / feather / border / smooth / fill holes / invert / none |
 | `fill` | Fill or erase the selection (or a region) on a paint layer |
 | `checkpoint` / `restore` / `list_checkpoints` / `drop_checkpoints` | In-memory snapshot of a document's layer pixels and properties; `restore` puts them back, also on view-less documents |
+| `set_layer_style` / `get_layer_style` | Outline (stroke) and drop shadow as a real Krita layer style, for SFX and lettering |
 | `list_capabilities` | Filters and their parameters, blending modes, installed fonts, brush presets |
 | `trigger_action` | Fire a Krita menu action by id (`edit_undo`, …) on the *active* document; script-running actions are refused while `run_python` is off (see *Arbitrary Python is opt-in*) |
 | `run_python` | Arbitrary Python inside Krita, full libkis access — **off by default** |
@@ -445,6 +446,7 @@ python test_stress_close.py    # trace/crash evidence parsing
 python test_gate.py            # the Python gate policy
 python test_schema.py          # argument validation at the MCP boundary
 python test_history.py         # checkpoint store: ids, budget, eviction
+python test_style.py           # layer style ASL builder and parser
 python test_raster.py          # magic wand / hole filling on raw pixels
 python test_svgshapes.py       # text, bubble and shape SVG generation
 ```
@@ -510,6 +512,7 @@ pykrita/
     vector_ops.py          editable text, bubbles and shapes
     svgshapes.py           shape specs -> SVG (pure, Krita-free)
     history_ops.py         checkpoint / restore of layer pixels and properties
+    style_ops.py           layer styles (stroke, drop shadow) as Krita ASL
     raster.py              magic wand / hole filling on pixel buffers (pure)
     imaging.py             QImage <-> Krita pixels, colour parsing, grid
 ```
