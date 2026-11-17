@@ -445,7 +445,16 @@ def op_set_layer_style(params):
         raise _err("Layer {0!r} is locked; unlock it with set_layer before "
                    "styling it.".format(node.name()))
 
-    before = _read_back(node)
+    warnings = []
+    try:
+        discarded = parse_style_asl(node.layerStyleToAsl())["other_effects"]
+    except StyleError:
+        # An unreadable old style must not make the layer unstyleable: the
+        # new style replaces it, we just cannot say what was lost.
+        discarded = []
+        warnings.append("The layer's previous style could not be read, so "
+                        "any effects it held are not listed in "
+                        "discarded_effects; it was replaced.")
     result = {"layer": node.name()}
     if clear and not node.layerStyleToAsl():
         result["style"] = {}
@@ -458,11 +467,12 @@ def op_set_layer_style(params):
     now = _read_back(node)
     result["style"] = {k: now[k] for k in ("stroke", "drop_shadow") if k in now}
     if result["style"] != expected_style(stroke, shadow):
-        result["warnings"] = [
-            "Krita holds a different style than requested; call "
-            "get_layer_style and compare."]
-    if before["other_effects"]:
-        result["discarded_effects"] = before["other_effects"]
+        warnings.append("Krita holds a different style than requested; call "
+                        "get_layer_style and compare.")
+    if warnings:
+        result["warnings"] = warnings
+    if discarded:
+        result["discarded_effects"] = discarded
     return result
 
 

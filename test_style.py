@@ -453,6 +453,95 @@ class RoundTripTests(unittest.TestCase):
         self.assertEqual(got, {"has_style": False, "other_effects": []})
 
 
+class FakeNode(object):
+    def __init__(self, asl):
+        self.asl = asl
+        self.applied = []
+
+    def type(self):
+        return "paintlayer"
+
+    def locked(self):
+        return False
+
+    def name(self):
+        return "Art"
+
+    def layerStyleToAsl(self):
+        return self.asl
+
+    def setLayerStyleFromAsl(self, asl):
+        self.applied.append(asl)
+        self.asl = asl
+        return True
+
+
+class FakeOps(object):
+    """Just enough of krita_mcp.ops for op_set_layer_style."""
+
+    class OpError(Exception):
+        def __init__(self, message, kind="invalid_request"):
+            Exception.__init__(self, message)
+            self.kind = kind
+
+    def __init__(self, node):
+        self.node = node
+
+    def resolve_document(self, ref):
+        return object()
+
+    def resolve_node(self, doc, ref):
+        return self.node
+
+    def _as_bool(self, value, key):
+        return value
+
+    def _refresh(self, doc):
+        pass
+
+
+class SetOpTests(unittest.TestCase):
+    def run_op(self, existing, **params):
+        node = FakeNode(existing)
+        original = style._o
+        style._o = lambda: FakeOps(node)
+        try:
+            return node, style.op_set_layer_style(dict(layer="Art", **params))
+        finally:
+            style._o = original
+
+    def test_unreadable_previous_style_does_not_block_a_new_one(self):
+        node, out = self.run_op("<asl><node",
+                                stroke={"size": 4, "color": "#fff"})
+        self.assertEqual(len(node.applied), 1)
+        self.assertEqual(out["style"]["stroke"]["size"], 4)
+        self.assertEqual(len(out["warnings"]), 1)
+        self.assertIn("could not be read", out["warnings"][0])
+        self.assertNotIn("discarded_effects", out)
+
+    def test_unreadable_previous_style_does_not_block_clear(self):
+        node, out = self.run_op("<asl><node", clear=True)
+        self.assertEqual(len(node.applied), 1)
+        self.assertEqual(out["style"], {})
+        self.assertIn("could not be read", out["warnings"][0])
+        self.assertEqual(style.parse_style_asl(node.asl),
+                         {"has_style": False, "other_effects": []})
+
+    def test_readable_previous_style_gives_no_warning(self):
+        _, out = self.run_op(BOTH, stroke={"size": 4, "color": "#fff"})
+        self.assertNotIn("warnings", out)
+
+    def test_discarded_effects_are_listed(self):
+        _, out = self.run_op(OTHER, drop_shadow={})
+        self.assertEqual(out["discarded_effects"],
+                         ["outer_glow", "color_overlay"])
+
+    def test_clear_without_style_touches_nothing(self):
+        node, out = self.run_op("", clear=True)
+        self.assertEqual(node.applied, [])
+        self.assertEqual(out["style"], {})
+
+
 if __name__ == "__main__":
     result = unittest.main(exit=False, verbosity=0).result
     if result.wasSuccessful():
