@@ -433,6 +433,16 @@ class CallToolTest(unittest.TestCase):
                 mcp_server.call_tool("fill", {"color": "#ffffff"})
         self.assertEqual(caught.exception.kind, "unknown_op")
 
+    def test_unreadable_health_keeps_the_original(self):
+        self.bridge.side_effect = mcp_server.BridgeError(
+            "unknown_op", "Unknown operation 'fill'.")
+        with mock.patch.object(mcp_server.BRIDGE, "health",
+                               side_effect=mcp_server.BridgeError(
+                                   "bad_response", "not JSON")):
+            with self.assertRaises(mcp_server.BridgeError) as caught:
+                mcp_server.call_tool("fill", {"color": "#ffffff"})
+        self.assertEqual(caught.exception.kind, "unknown_op")
+
     def test_every_error_is_on_its_own_line(self):
         with self.assertRaises(mcp_server.BridgeError) as caught:
             mcp_server.call_tool("create_document", {})

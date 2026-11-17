@@ -46,7 +46,7 @@ from .gate import (ENV_VAR, Gate, SETTING_KEY, UNSET, runs_code, summary,
                    truthy)
 from .imaging import ImagingError, parse_color
 
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.2.0"
 
 # Escape hatch for the size-changing operations. Krita 5.3.4 aborts in its own
 # canvas code when a document changes size under a view (see _refuse_on_view),
@@ -1200,17 +1200,31 @@ def op_create_layer(params):
     name = str(_arg(params, "name", "Layer"))
     raw_type = str(_arg(params, "type", "paintlayer")).lower().replace(" ", "")
     if raw_type not in _LAYER_TYPES:
-        raise OpError("Unknown layer type {0!r}. Supported: {1}".format(
-            raw_type, ", ".join(sorted(set(_LAYER_TYPES.values())))))
+        raise OpError(
+            "Unknown layer type {0!r}. Supported: {1}. Filter, fill and clone "
+            "layers and filter/transform/colorize masks are not offered: "
+            "created without their configuration they crash Krita on save."
+            .format(raw_type, ", ".join(sorted(set(_LAYER_TYPES.values())))))
     node_type = _LAYER_TYPES[raw_type]
+    is_mask = node_type.endswith("mask")
 
     parent_ref = params.get("parent")
-    is_mask = node_type.endswith("mask")
-    if is_mask and parent_ref in (None, ""):
-        raise OpError("A {0} applies to a layer: pass that layer as "
-                      "`parent`.".format(node_type))
-    parent = (resolve_node(doc, parent_ref, allow_root=True)
-              if parent_ref not in (None, "") else doc.rootNode())
+    if parent_ref in (None, ""):
+        if is_mask:
+            raise OpError("A {0} applies to a layer: pass that layer as "
+                          "`parent`.".format(node_type))
+        parent = doc.rootNode()
+    else:
+        # libkis hands out a new wrapper per call: compare with ==, never is.
+        parent = resolve_node(doc, parent_ref, allow_root=True)
+        if is_mask and (parent == doc.rootNode()
+                        or parent.type().endswith("mask")):
+            raise OpError("parent {0!r} is not a layer; a mask goes on a "
+                          "layer.".format(parent_ref))
+        if not is_mask and parent.type() != "grouplayer":
+            raise OpError("parent {0!r} is a {1}; layers can only be nested "
+                          "inside a group layer (masks go on any layer)."
+                          .format(parent_ref, parent.type()))
 
     if node_type == "grouplayer":
         node = doc.createGroupLayer(name)
@@ -1221,14 +1235,6 @@ def op_create_layer(params):
     if node is None:
         raise OpError("Krita could not create a {0} named {1!r}.".format(
             node_type, name))
-    if parent_ref not in (None, "") and parent is not doc.rootNode():
-        if is_mask and parent.type().endswith("mask"):
-            raise OpError("parent {0!r} is a mask; a mask goes on a layer."
-                          .format(parent_ref))
-        if not is_mask and parent.type() != "grouplayer":
-            raise OpError("parent {0!r} is a {1}; layers can only be nested "
-                          "inside a group layer (masks go on any layer)."
-                          .format(parent_ref, parent.type()))
 
     sibling_count = len(_children(parent))
     index = params.get("index")

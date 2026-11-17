@@ -24,7 +24,7 @@ import threading
 import time
 
 SERVER_NAME = "krita"
-SERVER_VERSION = "1.1.0"
+SERVER_VERSION = "1.2.0"
 
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 PREFERRED_PROTOCOL = "2025-06-18"
@@ -653,6 +653,12 @@ TOOLS = [
           "x": {"type": "integer"}, "y": {"type": "integer"},
           "width": {"type": "integer"}, "height": {"type": "integer"},
           "degrees": {"type": "number"},
+          "x_res": {"type": "number", "minimum": 1,
+                    "description": "scale: new horizontal resolution in dpi "
+                                   "(default unchanged)."},
+          "y_res": {"type": "number", "minimum": 1,
+                    "description": "scale: new vertical resolution in dpi "
+                                   "(default unchanged)."},
           "strategy": {"type": "string", "default": "Bicubic",
                        "description": "Scaling filter: Bicubic, Bilinear, "
                                       "NearestNeighbor, Lanczos3, Box."}},
@@ -1198,7 +1204,7 @@ def _version_skew(tool_name, op, original):
     """The plugin lacks an operation this server advertises: say why."""
     try:
         plugin = BRIDGE.health().get("plugin_version") or "unknown"
-    except BridgeUnavailable:
+    except Exception:  # noqa: BLE001 - never mask the original error
         return original
     return BridgeError(
         "plugin_outdated",
