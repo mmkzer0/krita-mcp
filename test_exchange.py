@@ -97,6 +97,46 @@ class PathTests(unittest.TestCase):
             exchange.check_import_path(target)
         self.assertIn(".webp", str(caught.exception))
 
+    def test_export_refuses_a_symlink_target(self):
+        real = self.path("real.png")
+        with open(real, "wb") as handle:
+            handle.write(b"stand-in")
+        link = self.path("link.png")
+        os.symlink(real, link)
+        for overwrite in (False, True):
+            with self.assertRaises(exchange.ExchangeError) as caught:
+                exchange.check_export_path(link, overwrite=overwrite)
+            self.assertIn("symbolic link", str(caught.exception))
+
+    def test_export_refuses_a_dangling_symlink(self):
+        absent = self.path("absent-target.png")
+        link = self.path("dangling.png")
+        os.symlink(absent, link)
+        with self.assertRaises(exchange.ExchangeError) as caught:
+            exchange.check_export_path(link)
+        self.assertIn("symbolic link", str(caught.exception))
+        self.assertFalse(os.path.exists(absent))
+        # "xb" refuses the link at the kernel level too: no target appears.
+        with self.assertRaises(exchange.ExchangeError):
+            exchange.write_png_file(link, b"data")
+        self.assertFalse(os.path.exists(absent))
+
+    def test_import_refuses_a_symlink(self):
+        real = self.path("real-image.png")
+        with open(real, "wb") as handle:
+            handle.write(b"stand-in")
+        link = self.path("link-image.png")
+        os.symlink(real, link)
+        with self.assertRaises(exchange.ExchangeError) as caught:
+            exchange.check_import_path(link)
+        self.assertIn("symbolic link", str(caught.exception))
+
+    def test_paths_with_a_nul_byte_are_refused(self):
+        for check in (exchange.check_export_path, exchange.check_import_path):
+            with self.assertRaises(exchange.ExchangeError) as caught:
+                check(self.path("page\x00.png"))
+            self.assertIn("NUL", str(caught.exception))
+
     def test_import_refuses_missing_file_and_relative_path(self):
         with self.assertRaises(exchange.ExchangeError) as caught:
             exchange.check_import_path(self.path("absent.png"))
@@ -104,6 +144,51 @@ class PathTests(unittest.TestCase):
         with self.assertRaises(exchange.ExchangeError) as caught:
             exchange.check_import_path("region.png")
         self.assertIn("absolute", str(caught.exception))
+
+
+class WriteTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.folder = tempfile.mkdtemp(prefix="exchange-write-")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.folder, ignore_errors=True)
+
+    def path(self, name):
+        return os.path.join(self.folder, name)
+
+    def test_exclusive_create_writes_once(self):
+        target = self.path("exclusive.png")
+        exchange.write_png_file(target, b"first")
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), b"first")
+        with self.assertRaises(exchange.ExchangeError) as caught:
+            exchange.write_png_file(target, b"second")
+        self.assertIn("already exists", str(caught.exception))
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), b"first")
+
+    def test_overwrite_renames_a_sibling_temp_over_the_target(self):
+        target = self.path("atomic.png")
+        exchange.write_png_file(target, b"old")
+        inode = os.stat(target).st_ino
+        exchange.write_png_file(target, b"new", overwrite=True)
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), b"new")
+        # os.replace() puts the temp file's inode at the target: a rename,
+        # not a truncate-then-write a reader could catch half done.
+        self.assertNotEqual(os.stat(target).st_ino, inode)
+        leftovers = [name for name in os.listdir(self.folder)
+                     if name.endswith(".tmp")]
+        self.assertEqual(leftovers, [])
+
+    def test_write_failures_are_reported_separately_from_arguments(self):
+        target = self.path(os.path.join("absent-dir", "page.png"))
+        with self.assertRaises(exchange.ExchangeWriteError) as caught:
+            exchange.write_png_file(target, b"data")
+        self.assertIn("Could not write", str(caught.exception))
+        self.assertEqual(exchange.ExchangeWriteError.kind, "internal")
 
 
 class RectTests(unittest.TestCase):
@@ -148,6 +233,18 @@ class RectTests(unittest.TestCase):
         with self.assertRaises(exchange.ExchangeError) as caught:
             exchange.check_pixel_budget((0, 0, 8001, 8000))
         self.assertIn("64 megapixels", str(caught.exception))
+
+    def test_import_budget_is_lower_than_the_export_budget(self):
+        self.assertEqual(
+            exchange.check_pixel_budget((0, 0, 4000, 4000),
+                                        limit=exchange.MAX_IMPORT_PIXELS),
+            16 * 1000 * 1000)
+        with self.assertRaises(exchange.ExchangeError) as caught:
+            exchange.check_pixel_budget((0, 0, 4001, 4000),
+                                        limit=exchange.MAX_IMPORT_PIXELS,
+                                        what="Importing")
+        self.assertIn("16 megapixels", str(caught.exception))
+        self.assertIn("16004000", str(caught.exception))
 
     def test_place_inside_the_canvas(self):
         placed, clipped = exchange.place_rect(30, 40, 100, 80, CANVAS)
@@ -274,6 +371,32 @@ class ExpectSizeTests(unittest.TestCase):
             self.assertIn("expect_size", str(caught.exception))
 
 
+class FiniteNumberTests(unittest.TestCase):
+    def test_non_finite_numbers_are_refused(self):
+        for value in (float("inf"), float("-inf"), float("nan"),
+                      "1e999", "Infinity", 10 ** 400):
+            with self.assertRaises(exchange.ExchangeError) as caught:
+                exchange.parse_region({"x": value, "width": 10,
+                                       "height": 10})
+            self.assertIn("finite", str(caught.exception))
+            self.assertIn("region.x", str(caught.exception))
+
+    def test_every_numeric_field_holds_the_line(self):
+        for call in (
+            lambda: exchange.parse_pad(float("inf")),
+            lambda: exchange.parse_region({"width": "1e999", "height": 10}),
+            lambda: exchange.parse_expect_size([float("inf"), 10]),
+            lambda: exchange.parse_expect_size([10, 10 ** 400]),
+        ):
+            with self.assertRaises(exchange.ExchangeError) as caught:
+                call()
+            self.assertIn("finite", str(caught.exception))
+
+    def test_ordinary_values_still_parse(self):
+        self.assertEqual(exchange.parse_region(
+            {"x": -5, "y": "7", "width": 10.4, "height": 2}), (-5, 7, 10, 2))
+
+
 class BufferTests(unittest.TestCase):
     def test_count_matches_a_naive_count(self):
         before = bytes(bytearray(range(256)) * 16)
@@ -326,15 +449,86 @@ class BufferTests(unittest.TestCase):
         with self.assertRaises(exchange.ExchangeError):
             exchange.merge_by_mask(b"\x00" * 8, b"\x00" * 4, b"\xff" * 2)
 
+    def test_merge_replace_is_byte_exact_at_full_coverage(self):
+        before = bytes(bytearray((0x01, 0x02, 0x03, 0x04) * 6))
+        # A semi-transparent stamp: premultiplied Qt would round these bytes.
+        stamp = bytes(bytearray((0x80, 0x40, 0x20, 0x10) * 6))
+        blended = bytes(bytearray((0xEE, 0xDD, 0xCC, 0xBB) * 6))
+        coverage = bytes((0, 1, 128, 254, 255, 255))
+        merged = exchange.merge_replace(before, stamp, coverage, blended)
+        for pixel in range(6):
+            chunk = merged[pixel * 4:pixel * 4 + 4]
+            if coverage[pixel] == 255:
+                expected = stamp[pixel * 4:pixel * 4 + 4]
+            elif coverage[pixel] == 0:
+                expected = before[pixel * 4:pixel * 4 + 4]
+            else:
+                expected = blended[pixel * 4:pixel * 4 + 4]
+            self.assertEqual(chunk, expected, "pixel {0}".format(pixel))
+        self.assertEqual(merged[16:24], stamp[16:24])
+
+    def test_merge_replace_starts_from_the_blend(self):
+        before = bytes((1, 2, 3, 4)) * 4
+        stamp = bytes((9, 8, 7, 6)) * 4
+        blended = bytes((5, 5, 5, 5)) * 4
+        # Every pixel partly covered: the blend is the answer, untouched.
+        self.assertEqual(exchange.merge_replace(before, stamp, b"\x80" * 4,
+                                                blended), blended)
+        merged = exchange.merge_replace(before, stamp,
+                                        bytes((0, 128, 255, 1)), blended)
+        self.assertEqual(merged[0:4], before[0:4])
+        self.assertEqual(merged[4:8], blended[4:8])
+        self.assertEqual(merged[8:12], stamp[8:12])
+        self.assertEqual(merged[12:16], blended[12:16])
+
+    def test_merge_replace_without_a_blend_keeps_partial_pixels(self):
+        before = b"\x11" * 8
+        stamp = b"\x22" * 8
+        merged = exchange.merge_replace(before, stamp, bytes((255, 128)))
+        self.assertEqual(merged[0:4], stamp[0:4])
+        self.assertEqual(merged[4:8], before[4:8])
+
+    def test_merge_replace_refuses_size_mismatch(self):
+        with self.assertRaises(exchange.ExchangeError):
+            exchange.merge_replace(b"\x00" * 8, b"\x00" * 8, b"\xff" * 1)
+        with self.assertRaises(exchange.ExchangeError):
+            exchange.merge_replace(b"\x00" * 8, b"\x00" * 4, b"\xff" * 2)
+        with self.assertRaises(exchange.ExchangeError):
+            exchange.merge_replace(b"\x00" * 8, b"\x00" * 8, b"\xff" * 2,
+                                   b"\x00" * 4)
+
+    def test_partial_coverage_detection(self):
+        self.assertFalse(exchange.has_partial_coverage(b""))
+        self.assertFalse(exchange.has_partial_coverage(b"\x00\xff\x00"))
+        self.assertTrue(exchange.has_partial_coverage(b"\x00\x01\xff"))
+        self.assertTrue(exchange.has_partial_coverage(b"\xfe"))
+
+    def test_alpha_within_keeps_transparent_pixels_out(self):
+        before_alpha = bytes((0, 0, 1, 128, 255, 0))
+        stamp_alpha = bytes((255, 0, 255, 7, 9, 4))
+        self.assertEqual(exchange.alpha_within(before_alpha, stamp_alpha),
+                         bytes((0, 0, 255, 7, 9, 0)))
+        with self.assertRaises(exchange.ExchangeError):
+            exchange.alpha_within(b"\x00", b"\x00\x00")
+
 
 class ErrorTypeTests(unittest.TestCase):
     def test_exchange_error_is_a_value_error(self):
         self.assertTrue(issubclass(exchange.ExchangeError, ValueError))
 
+    def test_write_failure_has_its_own_kind(self):
+        self.assertTrue(issubclass(exchange.ExchangeWriteError,
+                                   exchange.ExchangeError))
+        self.assertEqual(exchange.ExchangeError.kind, "invalid_request")
+        self.assertEqual(exchange.ExchangeWriteError.kind, "internal")
+
     def test_limits_are_the_documented_ones(self):
         self.assertEqual(exchange.MAX_PAD, 1024)
         self.assertEqual(exchange.MAX_PIXELS, 64 * 1000 * 1000)
+        self.assertEqual(exchange.MAX_IMPORT_PIXELS, 16 * 1000 * 1000)
         self.assertEqual(exchange.MODES, ("over", "replace"))
+        self.assertEqual(exchange.IMPORT_SUFFIXES,
+                         (".png", ".jpg", ".jpeg", ".webp"))
 
 
 if __name__ == "__main__":

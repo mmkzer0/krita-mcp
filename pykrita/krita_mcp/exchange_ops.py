@@ -14,6 +14,7 @@ running Krita.
 """
 
 import hashlib
+import math
 import operator
 import os
 import re
@@ -21,15 +22,33 @@ import re
 # A full page at 2500x3600 is 9 megapixels; 64 caps the buffers on both sides
 # of a single inpainting pass while leaving room for generous context.
 MAX_PIXELS = 64 * 1000 * 1000
+# Import is the heavier side: it keeps the decoded pixels, the ARGB32 copy,
+# the layer read-back, the stamp copy, the Qt composite and the merge result
+# alive together -- roughly 24-28 bytes per pixel. 16 megapixels is a little
+# under two full pages and caps that at about 0.5 GB; export encodes one
+# image at a time, so it keeps the 64 megapixel cap above.
+MAX_IMPORT_PIXELS = 16 * 1000 * 1000
 MAX_PAD = 1024
 IMPORT_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 MODES = ("over", "replace")
 
 _NONZERO = re.compile(b"[^\x00]+")
+_FULL = re.compile(b"\xff+")
+_ZERO = re.compile(b"\x00+")
+# bytes.translate table: 0 -> 0, 1..254 -> 255, 255 -> 0.
+_PARTIAL_TABLE = bytes([0x00] + [0xFF] * 254 + [0x00])
 
 
 class ExchangeError(ValueError):
     """A caller-fixable problem, raised before a single pixel is written."""
+
+    kind = "invalid_request"
+
+
+class ExchangeWriteError(ExchangeError):
+    """The filesystem failed a write the arguments asked for."""
+
+    kind = "internal"
 
 
 def _o():
@@ -60,10 +79,19 @@ def _as_int(value, key):
         raise ExchangeError(
             "{0} must be a number, got {1!r}".format(key, value))
     try:
-        return int(round(float(value)))
+        number = float(value)
     except (TypeError, ValueError):
         raise ExchangeError(
             "{0} must be a number, got {1!r}".format(key, value))
+    except OverflowError:
+        # int far too large for a float: 10 ** 400 from a JSON client.
+        raise ExchangeError(
+            "{0} must be a finite number, got {1!r}".format(key, value))
+    if not math.isfinite(number):
+        # inf, -inf and "1e999" all land here; JSON clients can send them.
+        raise ExchangeError(
+            "{0} must be a finite number, got {1!r}".format(key, value))
+    return int(round(number))
 
 
 def _require(params, key, hint):
@@ -153,6 +181,12 @@ def parse_expect_size(value):
 def _absolute(path, key="path"):
     if not isinstance(path, str) or not path.strip():
         raise ExchangeError("{0} must be a non-empty file path".format(key))
+    if "\x00" in path:
+        # open() and Qt raise ValueError on a NUL, which must be a refusal
+        # here and not an escaped crash.
+        raise ExchangeError(
+            "{0} contains a NUL byte, which cannot be part of a file path"
+            .format(key))
     expanded = os.path.expanduser(path.strip())
     if not os.path.isabs(expanded):
         raise ExchangeError(
@@ -168,6 +202,12 @@ def check_export_path(path, overwrite=False):
         raise ExchangeError(
             "path must end in .png, got {0!r}; export_region writes a PNG for "
             "the external tool.".format(os.path.basename(target)))
+    if os.path.islink(target):
+        # Checked before exists(): a dangling link is invisible to exists()
+        # and open("wb") would create its target somewhere else.
+        raise ExchangeError(
+            "path {0!r} is a symbolic link; pass the path of a real file."
+            .format(target))
     if os.path.isdir(target):
         raise ExchangeError(
             "path {0!r} is a directory; pass a file name.".format(target))
@@ -190,11 +230,80 @@ def check_import_path(path):
         raise ExchangeError(
             "path must be a .png, .jpg, .jpeg or .webp image, got {0!r}."
             .format(os.path.basename(target)))
+    if os.path.islink(target):
+        raise ExchangeError(
+            "path {0!r} is a symbolic link; pass the image file itself."
+            .format(target))
     if not os.path.isfile(target):
         raise ExchangeError(
             "No file at {0!r}. Export the region first with export_region, or "
             "fix the path.".format(target))
     return target
+
+
+def _open_sibling_temp(parent, base):
+    """An open "xb" handle next to ``target``, plus its path.
+
+    Same directory as the target so os.replace() is a rename, not a copy.
+    """
+    for _ in range(8):
+        candidate = os.path.join(
+            parent, ".{0}.{1}.tmp".format(base, os.urandom(6).hex()))
+        try:
+            return open(candidate, "xb"), candidate
+        except FileExistsError:
+            continue
+    raise ExchangeWriteError(
+        "Could not create a temporary file next to {0!r}.".format(
+            os.path.join(parent, base)))
+
+
+def write_png_file(target, data, overwrite=False):
+    """Write ``data`` to ``target`` exclusively, or atomically when replacing.
+
+    ``overwrite=False`` opens with "xb": the kernel refuses a file that
+    appeared after check_export_path's exists() check instead of truncating
+    it. ``overwrite=True`` writes a sibling temp file, fsyncs it and renames
+    it over the target, so a reader sees the old file or the whole new one
+    and a crash cannot leave a half-written PNG behind. Filesystem failures
+    raise ExchangeWriteError, which the bridge reports apart from bad
+    arguments.
+    """
+    if not overwrite:
+        try:
+            with open(target, "xb") as handle:
+                handle.write(data)
+        except FileExistsError:
+            raise ExchangeError(
+                "path {0!r} already exists; pass overwrite=true to replace it "
+                "or choose another name.".format(target))
+        except (OSError, ValueError) as exc:
+            raise ExchangeWriteError(
+                "Could not write {0!r}: {1}".format(target, exc))
+        return
+
+    try:
+        handle, temp = _open_sibling_temp(os.path.dirname(target),
+                                          os.path.basename(target))
+    except OSError as exc:
+        raise ExchangeWriteError(
+            "Could not write {0!r}: {1}".format(target, exc))
+    try:
+        with handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, target)
+        temp = None
+    except (OSError, ValueError) as exc:
+        raise ExchangeWriteError(
+            "Could not write {0!r}: {1}".format(target, exc))
+    finally:
+        if temp is not None:
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------
@@ -226,15 +335,16 @@ def expand_rect(rect, pad, canvas):
     return left, top, right - left, bottom - top
 
 
-def check_pixel_budget(rect, what="Exporting", fix="export a smaller "
-                       "region or less pad"):
+def check_pixel_budget(rect, limit=MAX_PIXELS, what="Exporting",
+                       fix="export a smaller region or less pad"):
     """Refuse a buffer that would dwarf the page it came from."""
     pixels = rect[2] * rect[3]
-    if pixels > MAX_PIXELS:
+    if pixels > limit:
         raise ExchangeError(
             "{0} {1}x{2} = {3} pixels exceeds the {4} pixel limit "
-            "(64 megapixels); {5}."
-            .format(what, rect[2], rect[3], pixels, MAX_PIXELS, fix))
+            "({5} megapixels); {6}."
+            .format(what, rect[2], rect[3], pixels, limit,
+                    limit // (1000 * 1000), fix))
     return pixels
 
 
@@ -289,6 +399,74 @@ def merge_by_mask(before, after, coverage):
     for match in _NONZERO.finditer(coverage):
         start, end = match.span()
         out[start * 4:end * 4] = after[start * 4:end * 4]
+    return bytes(out)
+
+
+def _partial_coverage(coverage):
+    """``coverage`` with only the partly covered pixels (0 < c < 255) left."""
+    return coverage.translate(_PARTIAL_TABLE)
+
+
+def has_partial_coverage(coverage):
+    """Does the selection partly cover any pixel at all?
+
+    When it does not -- the common hard rectangle or full-lasso case -- the
+    caller can skip the Qt blend, whose result no pixel would use.
+    """
+    return _partial_coverage(coverage).find(b"\xff") != -1
+
+
+def merge_replace(before, stamp, coverage, blended=None):
+    """The "replace" merge: the stamp's bytes where the selection is full.
+
+    "replace" promises the file's pixels as they are, transparency included,
+    and a premultiplied Qt composite cannot deliver that for semi-transparent
+    colours. So the merge is explicit, per pixel:
+
+    * coverage 255: the stamp's ARGB bytes, untouched;
+    * coverage 0: ``before``, untouched;
+    * any other coverage: ``blended``, the Qt weighted blend.
+
+    The blend is the starting point and only the two extremes are copied over
+    it, so a selection that is partly covered everywhere (a feather, a
+    gradient) costs no Python work per pixel -- only the runs of 0 and 255 do.
+    ``blended`` may be None when no pixel is partly covered; the partial
+    pixels then keep ``before``.
+    """
+    if len(before) != len(stamp) or len(stamp) != len(coverage) * 4:
+        raise ExchangeError(
+            "Cannot merge {0}/{1} bytes with a {2} byte mask."
+            .format(len(before), len(stamp), len(coverage)))
+    if blended is not None and len(blended) != len(before):
+        raise ExchangeError(
+            "Cannot merge a {0} byte blend into {1} bytes."
+            .format(len(blended), len(before)))
+    out = bytearray(before if blended is None else blended)
+    for match in _ZERO.finditer(coverage):
+        start, end = match.span()
+        out[start * 4:end * 4] = before[start * 4:end * 4]
+    for match in _FULL.finditer(coverage):
+        start, end = match.span()
+        out[start * 4:end * 4] = stamp[start * 4:end * 4]
+    return bytes(out)
+
+
+def alpha_within(before_alpha, stamp_alpha):
+    """Stamp alpha restricted to the pixels the layer already covers.
+
+    source-atop keeps the layer's alpha, and on a pixel whose alpha is 0 it
+    resolves to (0,0,0,0) -- which would overwrite the colour bytes Krita
+    keeps behind a transparent pixel. Excluding those pixels from the merge
+    keeps them byte-identical, which is what an alpha lock promises.
+    """
+    if len(before_alpha) != len(stamp_alpha):
+        raise ExchangeError(
+            "Cannot mask {0} alpha bytes with {1}."
+            .format(len(stamp_alpha), len(before_alpha)))
+    out = bytearray(stamp_alpha)
+    for match in _ZERO.finditer(before_alpha):
+        start, end = match.span()
+        out[start:end] = b"\x00" * (end - start)
     return bytes(out)
 
 
@@ -374,6 +552,9 @@ def _compose(before, stamp, mode, alpha_locked, coverage):
             touched = _alpha_bytes(source)
             if alpha_locked:
                 # Keep the layer's own coverage, as Krita's alpha lock does.
+                # Pixels the layer does not cover must keep their bytes too:
+                # source-atop yields (0,0,0,0) there, not "before".
+                touched = alpha_within(_alpha_bytes(before), touched)
                 painter.setCompositionMode(QPainter.CompositionMode_SourceAtop)
             else:
                 painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
@@ -393,7 +574,7 @@ def _reported(fn):
         try:
             return fn(params)
         except ExchangeError as exc:
-            raise _err(str(exc))
+            raise _err(str(exc), kind=getattr(exc, "kind", "invalid_request"))
     handler.__doc__ = fn.__doc__
     handler.__name__ = fn.__name__
     return handler
@@ -405,10 +586,10 @@ def op_export_region(params):
 
     Reads only: the document keeps its pixels and its undo history. Omit
     `layer` for the merged image (the page as it renders); pass one for that
-    layer's own pixels, which must be RGBA/U8. `pad` adds context on every
-    side, clamped to the canvas, and the returned `region` is the rect that
-    was actually exported. The merged image is the page as it renders right
-    now, so take a `checkpoint` first when exporting mid-edit.
+    paint layer's own pixels, which must be RGBA/U8. `pad` adds context on
+    every side, clamped to the canvas, and the returned `region` is the rect
+    that was actually exported. The merged image is the page as it renders
+    right now, so take a `checkpoint` first when exporting mid-edit.
     """
     from .compat import QImage, QRect
 
@@ -435,21 +616,30 @@ def op_export_region(params):
         image = doc.projection(rect[0], rect[1], rect[2], rect[3])
     else:
         source = node.name()
+        if node.type() != "paintlayer":
+            # Measured on Krita 5.3.4: a group layer's pixelData is 0 bytes,
+            # so exporting one would write a blank PNG instead of a refusal.
+            raise _err(
+                "Layer {0!r} is a {1}, which has no pixels of its own to "
+                "export; omit layer for the merged image, or export a paint "
+                "layer.".format(source, node.type()))
         try:
             image = imaging.read_node_image(node, QRect(*rect))
         except imaging.ImagingError as exc:
+            # Colour model, depth or a short pixelData read: the caller can
+            # act on all of these by converting the document.
             raise _err(str(exc))
     if image is None or image.isNull():
         raise _err("Krita returned an empty image for {0},{1} {2}x{3}."
-                   .format(rect[0], rect[1], rect[2], rect[3]))
+                   .format(rect[0], rect[1], rect[2], rect[3]),
+                   kind="internal")
 
     image = image.convertToFormat(QImage.Format_ARGB32)
-    data = imaging.qimage_to_png_bytes(image)
     try:
-        with open(target, "wb") as handle:
-            handle.write(data)
-    except OSError as exc:
-        raise _err("Could not write {0!r}: {1}".format(target, exc))
+        data = imaging.qimage_to_png_bytes(image)
+    except imaging.ImagingError as exc:
+        raise _err(str(exc), kind="internal")
+    write_png_file(target, data, overwrite)
 
     return {
         "path": target,
@@ -475,6 +665,10 @@ def op_import_region(params):
     change to the current selection, weighted by its coverage. Pixels outside
     the canvas are clipped and reported, not refused.
 
+    The header must state the image size and fit the import pixel limit; a
+    file that cannot be sized is refused before decoding. Only the part that
+    lands on the canvas is decoded when the image hangs off it.
+
     Writes pixels directly, which Krita's undo history does not record: take a
     `checkpoint` first.
     """
@@ -497,9 +691,9 @@ def op_import_region(params):
     expect = parse_expect_size(params.get("expect_size"))
     target = check_import_path(
         _require(params, "path", "an absolute image path"))
-    x = o._as_int(_require(
+    x = _as_int(_require(
         params, "x", "the canvas x of the image's top-left corner"), "x")
-    y = o._as_int(_require(
+    y = _as_int(_require(
         params, "y", "the canvas y of the image's top-left corner"), "y")
 
     alpha_locked = node.alphaLocked()
@@ -519,29 +713,51 @@ def op_import_region(params):
                 "selection_only=false.")
 
     # Read the header first: a hostile or mistaken file must not make Krita
-    # decode a gigapixel buffer before any limit applies.
-    header = QImageReader(target).size()
-    if header.isValid():
-        check_pixel_budget((0, 0, header.width(), header.height()),
-                           "Importing", "crop the image to the patched area")
-    image = QImage()
-    if not image.load(target):
-        raise _err("Could not read {0!r} as an image; export it with "
-                   "export_region, or check that the file is not damaged."
-                   .format(target))
-    image = image.convertToFormat(QImage.Format_ARGB32)
-    if expect is not None and (image.width(), image.height()) != expect:
+    # decode a gigapixel buffer before any limit applies. A handler without a
+    # readable header cannot be bounded, so it is refused rather than decoded.
+    reader = QImageReader(target)
+    header = reader.size()
+    if not header.isValid():
+        raise _err(
+            "Could not read the image size from {0!r}; its format has no "
+            "readable header, or the file is damaged. Re-save it as a PNG "
+            "and pass that.".format(os.path.basename(target)))
+    check_pixel_budget((0, 0, header.width(), header.height()),
+                       limit=MAX_IMPORT_PIXELS, what="Importing",
+                       fix="crop the file to the patched area")
+    if expect is not None and (header.width(), header.height()) != expect:
         raise _err(
             "expect_size is {0}x{1} but {2} is {3}x{4}; patch a copy of the "
             "exported file at its original size.".format(
                 expect[0], expect[1], os.path.basename(target),
-                image.width(), image.height()))
+                header.width(), header.height()))
 
-    placed, clipped = place_rect(x, y, image.width(), image.height(),
+    placed, clipped = place_rect(x, y, header.width(), header.height(),
                                  (0, 0, doc.width(), doc.height()))
     dst = QRect(*placed)
-    source = image.copy(QRect(placed[0] - x, placed[1] - y,
-                              placed[2], placed[3]))
+    crop = QRect(placed[0] - x, placed[1] - y, placed[2], placed[3])
+    if clipped:
+        # The off-canvas part never becomes layer pixels, so ask for only the
+        # placed part instead of copying the whole image afterwards. Measured
+        # on Krita 5.3.4/Qt 5.15: the PNG handler still materialises the full
+        # decode (+92 MB for a 24 MP clip), so this bounds our buffers, not
+        # Qt's; the header budget above is what bounds the decode.
+        reader.setClipRect(crop)
+    image = reader.read()
+    if image.isNull():
+        raise _err("Could not read {0!r} as an image; export it with "
+                   "export_region, or check that the file is not damaged."
+                   .format(os.path.basename(target)))
+    if (image.width(), image.height()) != (crop.width(), crop.height()):
+        raise _err(
+            "{0} reports {1}x{2}, so {3}x{4} of it lands on the canvas, but "
+            "Qt decoded {5}x{6}. The format does not support clipped "
+            "decoding, or the header lies; re-save it as a PNG and retry."
+            .format(os.path.basename(target), header.width(), header.height(),
+                    crop.width(), crop.height(), image.width(),
+                    image.height()))
+    image = image.convertToFormat(QImage.Format_ARGB32)
+    source = image
 
     o._refresh(doc)
     try:
@@ -560,23 +776,34 @@ def op_import_region(params):
                 "region.".format(len(coverage), dst.width(),
                                  dst.height()))
 
-    if mode == "replace" and coverage is None:
-        # Straight copy: going through QPainter's premultiplied buffers would
-        # round semi-transparent pixels (measured on Qt 5.15), so the patch
-        # bytes are written untouched.
-        after = source
-        after_bytes = _image_bytes(after)
+    if mode == "replace":
+        # Straight copy of the stamp's bytes: going through QPainter's
+        # premultiplied buffers would round semi-transparent pixels (measured
+        # on Qt 5.15).
+        stamp_bytes = _image_bytes(source)
+        if coverage is None:
+            after_bytes = stamp_bytes
+        else:
+            # Full coverage takes the stamp's bytes exactly, coverage 0 keeps
+            # the layer's, and only partly covered pixels go through the Qt
+            # blend -- whose result is unused when there are no partials.
+            blended = None
+            if has_partial_coverage(coverage):
+                composed, _ = _compose(before, source, mode, False, coverage)
+                blended = _image_bytes(composed)
+            after_bytes = merge_replace(before_bytes, stamp_bytes, coverage,
+                                        blended)
     else:
         composed, touched = _compose(before, source, mode, alpha_locked,
                                      coverage)
         after_bytes = _image_bytes(composed)
         if touched is not None:
             after_bytes = merge_by_mask(before_bytes, after_bytes, touched)
-        after = QImage(after_bytes, dst.width(), dst.height(), dst.width() * 4,
-                       QImage.Format_ARGB32).copy()
 
     changed = count_changed_pixels(before_bytes, after_bytes)
     if changed:
+        after = QImage(after_bytes, dst.width(), dst.height(), dst.width() * 4,
+                       QImage.Format_ARGB32).copy()
         imaging.write_node_image(node, dst, after)
         o._refresh(doc)
     return {

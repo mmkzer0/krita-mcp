@@ -1022,13 +1022,16 @@ TOOLS = [
          "inpainting model, an image editor) can patch, then paste back with "
          "import_region -- no base64 image data in the conversation. Omit "
          "`layer` for the merged image (the page as it renders, not the "
-         "active layer); pass one for that layer's own pixels (RGBA/U8 "
-         "only). `pad` adds context on every side, clamped to the canvas. The "
-         "returned region is the rect actually exported, so import it back at "
+         "active layer); pass one for that paint layer's own pixels (RGBA/U8 "
+         "only; a group has no pixels of its own and is refused). `pad` adds "
+         "context on every side, clamped to the canvas. The returned region "
+         "is the rect actually exported, so import it back at "
          "region.x/region.y. Refuses a relative path, a non-.png extension, "
-         "an existing file without overwrite=true, a missing directory (it "
-         "does not create one), a region off the canvas, and more than 64 "
-         "megapixels. Reads only.",
+         "a symbolic link, an existing file without overwrite=true (which "
+         "replaces it atomically), a missing directory (it does not create "
+         "one), a region off the canvas, and more than 64 megapixels. Pixels "
+         "are raw 8-bit RGBA in the document's colour space, no ICC profile. "
+         "Reads only.",
          {"document": DOCUMENT_PROP,
           "region": REGION_PROP,
           "layer": LAYER_PROP,
@@ -1051,11 +1054,14 @@ TOOLS = [
          "writes the image's pixels as they are, transparency included, and "
          "is refused on an alpha-locked layer (over keeps the layer's alpha, "
          "like fill). selection_only limits the change to the current "
-         "selection, weighted by its coverage, and needs a selection. Pixels "
-         "outside the canvas are clipped and reported, not refused; images "
-         "over 64 megapixels are refused before decoding. Writes pixels "
-         "directly, which Krita's undo does not record: take a checkpoint "
-         "first.",
+         "selection, weighted by its coverage, and needs a selection; with "
+         "replace, fully selected pixels get the file's bytes exactly. Pixels "
+         "outside the canvas are clipped and reported, not refused. Refuses "
+         "a symbolic link, a file whose header does not state its size, and "
+         "images over 16 megapixels (checked before decoding). Pixels are "
+         "raw 8-bit RGBA in the document's colour space, no ICC profile. "
+         "Writes pixels directly, which Krita's undo does not record: take a "
+         "checkpoint first.",
          {"document": DOCUMENT_PROP,
           "layer": LAYER_PROP,
           "path": {"type": "string",
