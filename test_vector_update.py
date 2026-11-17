@@ -8,6 +8,7 @@ Krita-free: vector_ops is loaded with a fake ``krita_mcp.compat`` and
 """
 
 import importlib.util
+import math
 import sys
 from pathlib import Path
 import types
@@ -100,6 +101,26 @@ def _load_modules():
     ops._as_bool = _as_bool
     ops._as_int = _as_int
     ops._log = _log
+
+    def _node_uuid(node):
+        raw = node.uniqueId()
+        return str(raw).strip("{}") or None
+
+    def _insert_node(parent, child, ui_index):
+        siblings = list(parent.childNodes())
+        count = len(siblings)
+        ui_index = max(0, min(count, ui_index))
+        below_pos = count - ui_index - 1
+        above = siblings[below_pos] if below_pos >= 0 else None
+        parent.addChildNode(child, above)
+
+    ops._node_uuid = _node_uuid
+    ops._insert_node = _insert_node
+    ops._parent_of = lambda doc, node: node.parentNode()
+    ops._refresh = lambda doc: None
+    ops.resolve_document = lambda ref: ops.document
+    ops.resolve_node = lambda doc, ref: [
+        n for n in doc.rootNode().childNodes() if n.name() == ref][0]
     sys.modules["krita_mcp.ops"] = ops
     package.ops = ops
 
@@ -430,6 +451,563 @@ class LayerNameTests(unittest.TestCase):
         self.assertEqual(caught.exception.kind, "ambiguous")
         self.assertRegex(str(caught.exception),
                          "more than once.*remove_vector_shapes")
+
+
+class _FakeNode(object):
+    """Just enough of libkis Node for the layer-swap logic."""
+
+    _serial = [0]
+
+    def __init__(self, name, kind="paintlayer"):
+        _FakeNode._serial[0] += 1
+        self._name = name
+        self._kind = kind
+        self._id = "node-{0}".format(_FakeNode._serial[0])
+        self.parent = None
+        self.children = []
+        # "ok" | "noop" (returns False, stays) | "raise" (stays) |
+        # "raise_after" (detaches, then raises)
+        self.remove_mode = "ok"
+        # "ok" | "false" (returns False, nothing attached) |
+        # "lie" (returns True, nothing attached)
+        self.attach_mode = "ok"
+
+    def uniqueId(self):
+        return self._id
+
+    def name(self):
+        return self._name
+
+    def type(self):
+        return self._kind
+
+    def childNodes(self):
+        return list(self.children)
+
+    def parentNode(self):
+        return self.parent
+
+    def addChildNode(self, child, above):
+        if self.attach_mode == "false":
+            return False
+        if self.attach_mode == "lie":
+            return True
+        index = 0 if above is None else self.children.index(above) + 1
+        self.children.insert(index, child)
+        child.parent = self
+        return True
+
+    def _detach(self):
+        if self.parent is not None and self in self.parent.children:
+            self.parent.children.remove(self)
+        self.parent = None
+
+    def remove(self):
+        if self.remove_mode == "noop":
+            return False
+        if self.remove_mode == "raise":
+            raise RuntimeError("remove exploded")
+        self._detach()
+        if self.remove_mode == "raise_after":
+            raise RuntimeError("remove exploded after detaching")
+        return True
+
+
+class _FakeRect(object):
+    def __init__(self, element):
+        self._e = element
+
+    def x(self):
+        return float(self._e.get("x", 0))
+
+    def y(self):
+        return float(self._e.get("y", 0))
+
+    def width(self):
+        return float(self._e.get("width", 0))
+
+    def height(self):
+        return float(self._e.get("height", 0))
+
+
+class _VecShape(object):
+    def __init__(self, element, layer):
+        self.element = element
+        self.layer = layer
+
+    def name(self):
+        return self.element.get("id")
+
+    def setName(self, name):
+        if not self.layer.sticky_names:
+            self.element.set("id", name)
+
+    def type(self):
+        return "KoPathShape"
+
+    def visible(self):
+        return True
+
+    def boundingBox(self):
+        return _FakeRect(self.element)
+
+
+_LAYER_PROPS = {"opacity": 255, "visible": True, "blendingMode": "normal",
+                "inheritAlpha": False, "colorLabel": 0, "collapsed": False,
+                "locked": False}
+
+
+class _FakeVector(_FakeNode):
+    """A vector layer: addShapesFromSvg keeps ids as names, toSvg uniquifies
+    them the way Krita 5.3.4 does (measured: x, x1, x -> x, x1, x2)."""
+
+    def __init__(self, name):
+        _FakeNode.__init__(self, name, "vectorlayer")
+        self.props = dict(_LAYER_PROPS)
+        self.elements = []
+        self.rename_on_import = {}
+        self.sticky_names = False  # setName() is ignored
+
+    def __getattr__(self, attr):
+        if attr in _LAYER_PROPS:
+            return lambda: self.props[attr]
+        if attr.startswith("set") and attr[3:4].isupper():
+            key = attr[3].lower() + attr[4:]
+            if key in _LAYER_PROPS:
+                def setter(value, key=key):
+                    self.props[key] = value
+                return setter
+        raise AttributeError(attr)
+
+    def layerStyleToAsl(self):
+        return ""
+
+    def shapes(self):
+        return [_VecShape(e, self) for e in self.elements]
+
+    def addShapesFromSvg(self, svg):
+        root = svgshapes.parse_layer_svg(svg)
+        made = []
+        seen = set()
+        for element in svgshapes.layer_shape_elements(root):
+            element = svgshapes.ET.fromstring(
+                svgshapes.ET.tostring(element, encoding="unicode"))
+            old = element.get("id")
+            new = self.rename_on_import.get(old, old)
+            if new in seen:  # Krita renames a repeated id inside one import
+                new = new + "_1681b89e"
+            seen.add(new)
+            element.set("id", new)
+            self.elements.append(element)
+            made.append(_VecShape(element, self))
+        return made
+
+    def toSvg(self):
+        if not self.elements:
+            return ""
+        root = svgshapes.ET.fromstring(
+            '<svg xmlns="http://www.w3.org/2000/svg" width="288pt" '
+            'height="216pt" viewBox="0 0 288 216"/>')
+        used = set()
+        for element in self.elements:
+            copy = svgshapes.ET.fromstring(
+                svgshapes.ET.tostring(element, encoding="unicode"))
+            base = copy.get("id")
+            ident, n = base, 0
+            while ident in used:
+                n += 1
+                ident = "{0}{1}".format(base, n)
+            used.add(ident)
+            copy.set("id", ident)
+            root.append(copy)
+        return svgshapes.ET.tostring(root, encoding="unicode")
+
+
+class _FakeDoc(object):
+    def __init__(self):
+        self.root = _FakeNode("root", "grouplayer")
+        self.active = None
+        self.set_active_fails = False
+        self.created = []
+
+    def width(self):
+        return 1200
+
+    def height(self):
+        return 900
+
+    def xRes(self):
+        return 72.0
+
+    def yRes(self):
+        return 72.0
+
+    def resolution(self):
+        return 72.0
+
+    def rootNode(self):
+        return self.root
+
+    def createVectorLayer(self, name):
+        layer = _FakeVector(name)
+        self.created.append(layer)
+        return layer
+
+    def activeNode(self):
+        return self.active
+
+    def setActiveNode(self, node):
+        if self.set_active_fails:
+            raise RuntimeError("no view")
+        self.active = node
+
+    def add(self, node):
+        self.root.addChildNode(node, self.root.children[-1]
+                               if self.root.children else None)
+        return node
+
+    def vector(self, name, shapes):
+        """A vector layer on top of the stack; ``shapes`` = [(id, x, width)].
+
+        One import per shape, like a user adding them over time (a single
+        import would rename repeated ids)."""
+        layer = _FakeVector(name)
+        for i, x, w in shapes:
+            layer.addShapesFromSvg(
+                '<svg xmlns="http://www.w3.org/2000/svg"><rect id="{0}" '
+                'x="{1}" y="0" width="{2}" height="5"/></svg>'.format(i, x, w))
+        return self.add(layer)
+
+
+def _stack(shapes=(("a", 0, 10), ("b", 20, 10))):
+    """Bottom / Letters (vector) / Top inside a fake document."""
+    doc = _FakeDoc()
+    bottom = doc.add(_FakeNode("Bottom"))
+    layer = doc.vector("Letters", list(shapes))
+    top = doc.add(_FakeNode("Top"))
+    sys.modules["krita_mcp.ops"].document = doc
+    return doc, bottom, layer, top
+
+
+def _names(node):
+    return [c.name() for c in node.children]
+
+
+class RebuildLayerTests(unittest.TestCase):
+    """F1/F10: the swap is all-or-nothing."""
+
+    def rebuild(self, doc, layer):
+        names, svg = vector_ops._layer_snapshot(layer)
+        return vector_ops._rebuild_layer(doc, layer, svg, names)
+
+    def assert_untouched(self, doc, bottom, layer, top):
+        self.assertEqual(doc.root.children, [bottom, layer, top])
+        self.assertEqual([s.name() for s in layer.shapes()], ["a", "b"])
+
+    def test_swap_keeps_position_names_and_selection(self):
+        doc, bottom, layer, top = _stack()
+        layer.setOpacity(128)
+        doc.active = layer
+        new = self.rebuild(doc, layer)
+        self.assertIsNot(new, layer)
+        self.assertEqual(doc.root.children, [bottom, new, top])
+        self.assertEqual([s.name() for s in new.shapes()], ["a", "b"])
+        self.assertEqual(new.opacity(), 128)
+        self.assertIs(doc.active, new)
+
+    def test_attach_returning_false_keeps_the_original(self):
+        doc, bottom, layer, top = _stack()
+        doc.root.attach_mode = "false"
+        with self.assertRaisesRegex(OpError, "did not attach"):
+            self.rebuild(doc, layer)
+        self.assert_untouched(doc, bottom, layer, top)
+
+    def test_attach_reporting_true_without_attaching_keeps_the_original(self):
+        doc, bottom, layer, top = _stack()
+        doc.root.attach_mode = "lie"
+        with self.assertRaisesRegex(OpError, "did not attach"):
+            self.rebuild(doc, layer)
+        self.assert_untouched(doc, bottom, layer, top)
+
+    def test_duplicate_names_are_restored_after_the_import_renames_them(self):
+        doc, bottom, layer, top = _stack(
+            (("x", 0, 10), ("x", 20, 20), ("x1", 40, 30)))
+        new = self.rebuild(doc, layer)
+        self.assertEqual(doc.root.children, [bottom, new, top])
+        self.assertEqual([s.name() for s in new.shapes()], ["x", "x", "x1"])
+
+    def test_wrong_names_after_import_keep_the_original(self):
+        doc, bottom, layer, top = _stack()
+        real = doc.createVectorLayer
+
+        def renaming(name):
+            made = real(name)
+            made.rename_on_import = {"b": "b1"}
+            made.sticky_names = True
+            return made
+        doc.createVectorLayer = renaming
+        with self.assertRaisesRegex(OpError, "names .*instead of"):
+            self.rebuild(doc, layer)
+        self.assert_untouched(doc, bottom, layer, top)
+        self.assertEqual(doc.root.children.count(doc.created[0]), 0)
+
+    def test_original_refusing_removal_discards_the_copy(self):
+        doc, bottom, layer, top = _stack()
+        layer.remove_mode = "noop"
+        with self.assertRaisesRegex(OpError, "could not remove the original"):
+            self.rebuild(doc, layer)
+        self.assert_untouched(doc, bottom, layer, top)
+
+    def test_original_removal_raising_while_still_attached(self):
+        doc, bottom, layer, top = _stack()
+        layer.remove_mode = "raise"
+        with self.assertRaisesRegex(OpError, "could not remove the original"):
+            self.rebuild(doc, layer)
+        self.assert_untouched(doc, bottom, layer, top)
+
+    def test_original_removal_raising_after_detaching_is_success(self):
+        doc, bottom, layer, top = _stack()
+        layer.remove_mode = "raise_after"
+        new = self.rebuild(doc, layer)
+        self.assertEqual(doc.root.children, [bottom, new, top])
+
+    def test_uncollectable_copy_is_reported_as_two_layers(self):
+        doc, bottom, layer, top = _stack()
+        real = doc.createVectorLayer
+
+        def stubborn(name):
+            made = real(name)
+            made.rename_on_import = {"b": "b1"}
+            made.sticky_names = True
+            made.remove_mode = "noop"
+            return made
+        doc.createVectorLayer = stubborn
+        with self.assertRaisesRegex(OpError, "two layers") as caught:
+            self.rebuild(doc, layer)
+        self.assertEqual(caught.exception.kind, "internal")
+        self.assertIn(layer, doc.root.children)
+
+    def test_selection_failure_does_not_undo_an_applied_edit(self):
+        doc, bottom, layer, top = _stack()
+        doc.active = layer
+        doc.set_active_fails = True
+        new = self.rebuild(doc, layer)
+        self.assertEqual(doc.root.children, [bottom, new, top])
+
+    def test_rebuild_refuses_a_layer_with_masks(self):
+        doc, bottom, layer, top = _stack()
+        mask = _FakeNode("Soft mask", "transparencymask")
+        layer.addChildNode(mask, None)
+        names, svg = vector_ops._layer_snapshot(layer)
+        with self.assertRaisesRegex(OpError, "Soft mask.*transparencymask"):
+            vector_ops._rebuild_layer(doc, layer, svg, names)
+        self.assertEqual(doc.root.children, [bottom, layer, top])
+        self.assertEqual(layer.children, [mask])
+        self.assertEqual(doc.created, [])
+
+    def test_scratch_removal_failure_is_reported(self):
+        self.assertFalse(vector_ops._remove_layer(_stuck("noop"), "scratch"))
+        self.assertFalse(vector_ops._remove_layer(_stuck("raise"), "scratch"))
+        self.assertTrue(vector_ops._remove_layer(_stuck("ok"), "scratch"))
+
+
+def _stuck(mode):
+    node = _FakeNode("mcp-scratch", "vectorlayer")
+    node.remove_mode = mode
+    return node
+
+
+class PositionalUpdateTests(unittest.TestCase):
+    """F11: shapes are addressed by position, never by exported SVG id."""
+
+    def widths(self, layer):
+        return [s.element.get("width") for s in layer.shapes()]
+
+    def test_export_uniquifies_but_names_are_restored_by_position(self):
+        doc, _bottom, layer, _top = _stack(
+            (("x", 0, 10), ("x", 20, 20), ("x1", 40, 30)))
+        self.assertEqual(svgshapes.layer_shape_ids(layer.toSvg()),
+                         ["x", "x1", "x11"])
+        names, svg = vector_ops._layer_snapshot(layer)
+        self.assertEqual(names, ["x", "x", "x1"])
+        self.assertEqual(svgshapes.layer_shape_ids(svg), ["x", "x", "x1"])
+
+    def test_update_of_the_third_shape_touches_the_third_shape(self):
+        doc, bottom, layer, top = _stack(
+            (("x", 0, 10), ("x", 20, 20), ("x1", 40, 30)))
+        result = vector_ops.op_update_vector_shapes({
+            "layer": "Letters",
+            "updates": [{"name": "x1", "shape": {
+                "type": "rect", "x": 40, "y": 0, "width": 77,
+                "height": 5}}]})
+        new = doc.root.children[1]
+        self.assertIsNot(new, layer)
+        self.assertEqual(doc.root.children, [bottom, new, top])
+        self.assertEqual([s.name() for s in new.shapes()], ["x", "x", "x1"])
+        self.assertEqual(self.widths(new), ["10", "20", "77"])
+        self.assertTrue(result["layer_rebuilt"])
+        self.assertEqual([u["name"] for u in result["updated"]], ["x1"])
+        self.assertEqual([c for c in doc.root.children
+                          if c.name() == "mcp-scratch"], [])
+
+    def test_duplicate_name_is_still_ambiguous(self):
+        doc, bottom, layer, top = _stack(
+            (("x", 0, 10), ("x", 20, 20), ("x1", 40, 30)))
+        with self.assertRaises(OpError) as caught:
+            vector_ops.op_update_vector_shapes({
+                "layer": "Letters",
+                "updates": [{"name": "x", "shape": {
+                    "type": "rect", "x": 0, "y": 0, "width": 9,
+                    "height": 5}}]})
+        self.assertEqual(caught.exception.kind, "ambiguous")
+        self.assertEqual(doc.root.children, [bottom, layer, top])
+
+    def test_remove_by_position_keeps_the_remaining_names(self):
+        doc, bottom, layer, top = _stack(
+            (("x", 0, 10), ("x", 20, 20), ("x1", 40, 30)))
+        result = vector_ops.op_remove_vector_shapes({
+            "layer": "Letters", "names": ["x1"]})
+        new = doc.root.children[1]
+        self.assertEqual(result["removed"], 1)
+        self.assertEqual([s.name() for s in new.shapes()], ["x", "x"])
+        self.assertEqual(self.widths(new), ["10", "20"])
+
+    def test_krita_export_with_a_different_shape_count_is_refused(self):
+        doc, bottom, layer, top = _stack()
+        one_shape = svgshapes.ET.tostring(
+            svgshapes.ET.fromstring(layer.toSvg())[0], encoding="unicode")
+        layer.toSvg = lambda: (
+            '<svg xmlns="http://www.w3.org/2000/svg">{0}</svg>'.format(
+                one_shape))
+        with self.assertRaisesRegex(OpError, "exports 1 top-level shapes"):
+            vector_ops._layer_snapshot(layer)
+        with self.assertRaisesRegex(OpError, "exports 1 top-level shapes"):
+            vector_ops.op_remove_vector_shapes({
+                "layer": "Letters", "names": ["a"]})
+        self.assertEqual(doc.root.children, [bottom, layer, top])
+
+
+class AddRollbackTests(unittest.TestCase):
+    """F7: roll back by rebuilding only when the user's layer was touched."""
+
+    def setUp(self):
+        self.rebuilds = []
+        self.real_rebuild = vector_ops._rebuild_layer
+        self.real_place = vector_ops._place_in_box
+
+        def spy(doc, layer, svg, names):
+            self.rebuilds.append(list(names))
+            return self.real_rebuild(doc, layer, svg, names)
+
+        def failing_place(*_args, **_kwargs):
+            raise OpError("trial exploded")
+        vector_ops._rebuild_layer = spy
+        vector_ops._place_in_box = failing_place
+
+    def tearDown(self):
+        vector_ops._rebuild_layer = self.real_rebuild
+        vector_ops._place_in_box = self.real_place
+
+    BOXED = {"type": "text", "text": "Hi", "name": "hello",
+             "box": {"x": 0, "y": 0, "width": 100, "height": 50}}
+    PLAIN = {"type": "rect", "x": 0, "y": 0, "width": 9, "height": 5,
+             "name": "plain"}
+
+    def test_untouched_layer_is_not_rebuilt_on_a_trial_failure(self):
+        doc, bottom, layer, top = _stack()
+        with self.assertRaisesRegex(OpError, "trial exploded"):
+            vector_ops.op_add_vector_shapes({
+                "layer": "Letters", "shapes": [self.BOXED]})
+        self.assertEqual(self.rebuilds, [])
+        self.assertEqual(doc.root.children, [bottom, layer, top])
+        self.assertEqual([s.name() for s in layer.shapes()], ["a", "b"])
+        self.assertEqual([n for n in _names(doc.root)
+                          if n == "mcp-scratch"], [])
+
+    def test_touched_layer_is_rebuilt_from_its_snapshot(self):
+        doc, bottom, layer, top = _stack()
+        with self.assertRaisesRegex(OpError, "trial exploded"):
+            vector_ops.op_add_vector_shapes({
+                "layer": "Letters", "shapes": [self.PLAIN, self.BOXED]})
+        self.assertEqual(self.rebuilds, [["a", "b"]])
+        current = doc.root.children[1]
+        self.assertEqual(_names(doc.root), ["Bottom", "Letters", "Top"])
+        self.assertEqual([s.name() for s in current.shapes()], ["a", "b"])
+
+    def test_masked_layer_refuses_a_boxed_add_before_any_change(self):
+        doc, bottom, layer, top = _stack()
+        layer.addChildNode(_FakeNode("Soft mask", "transparencymask"), None)
+        with self.assertRaisesRegex(OpError, "Soft mask"):
+            vector_ops.op_add_vector_shapes({
+                "layer": "Letters", "shapes": [self.PLAIN, self.BOXED]})
+        self.assertEqual(doc.created, [])
+        self.assertEqual([s.name() for s in layer.shapes()], ["a", "b"])
+
+
+class MaskAndLockTests(unittest.TestCase):
+    """F9/F15: refuse before anything changes."""
+
+    def test_update_with_replacement_refused_on_a_masked_layer(self):
+        doc, bottom, layer, top = _stack()
+        mask = _FakeNode("Soft mask", "transparencymask")
+        layer.addChildNode(mask, None)
+        with self.assertRaisesRegex(OpError, "Soft mask.*transparencymask"):
+            vector_ops.op_update_vector_shapes({
+                "layer": "Letters",
+                "updates": [{"name": "a", "shape": {
+                    "type": "rect", "x": 0, "y": 0, "width": 9,
+                    "height": 5}}]})
+        self.assertEqual(doc.root.children, [bottom, layer, top])
+        self.assertEqual(layer.children, [mask])
+        self.assertEqual(doc.created, [])
+
+    def test_remove_refused_on_a_masked_layer(self):
+        doc, bottom, layer, top = _stack()
+        layer.addChildNode(_FakeNode("Soft mask", "transparencymask"), None)
+        with self.assertRaisesRegex(OpError, "Soft mask"):
+            vector_ops.op_remove_vector_shapes({
+                "layer": "Letters", "names": ["a"]})
+        self.assertEqual(doc.root.children, [bottom, layer, top])
+        self.assertEqual([s.name() for s in layer.shapes()], ["a", "b"])
+
+    def test_remove_refused_on_a_locked_layer(self):
+        doc, bottom, layer, top = _stack()
+        layer.setLocked(True)
+        with self.assertRaisesRegex(OpError, "locked"):
+            vector_ops.op_remove_vector_shapes({
+                "layer": "Letters", "names": ["a"]})
+        self.assertEqual(doc.root.children, [bottom, layer, top])
+        self.assertEqual(doc.created, [])
+
+
+class BoxFinitenessTests(unittest.TestCase):
+    """F8: NaN/inf must be refused while still pure validation."""
+
+    BOX = {"x": 10, "y": 20, "width": 100, "height": 60}
+
+    def spec(self, **box):
+        return {"type": "text", "text": "Hi",
+                "box": dict(self.BOX, **box)}
+
+    def refused(self, spec, field):
+        with self.assertRaisesRegex(OpError, field + ".*finite"):
+            vector_ops._split_box(spec, 0)
+
+    def test_non_finite_box_fields_refused(self):
+        for field in ("x", "y", "width", "height"):
+            for bad in (float("nan"), float("inf"), float("-inf"), 1e999,
+                        10 ** 400):
+                with self.subTest(field=field, bad=bad):
+                    self.refused(self.spec(**{field: bad}), field)
+
+    def test_non_finite_size_and_min_size_refused(self):
+        for bad in (float("nan"), float("inf")):
+            self.refused(dict(self.spec(), size=bad), "size")
+            self.refused(dict(self.spec(), min_size=bad), "min_size")
+
+    def test_finite_box_still_parses(self):
+        _spec, layout = vector_ops._split_box(self.spec(), 0)
+        self.assertTrue(all(math.isfinite(v) for v in layout["box"]))
 
 
 if __name__ == "__main__":

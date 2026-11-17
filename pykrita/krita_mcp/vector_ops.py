@@ -16,10 +16,12 @@ when no document is active (only view-less documents open) and otherwise
 removes through the active document's view and undo (F31). Instead a layer edit
 copies the layer's own ``toSvg()``, drops/replaces/splices elements in that
 string (document order is stacking order) and replays it into a fresh vector
-layer with ``_rebuild_layer``. A rebuild gives the layer a new uuid, which the
-results report as ``layer_rebuilt``. Box-fit trials run on a scratch vector
-layer that is discarded with ``Node.remove()``; ``Node.remove()`` does not have
-the F31 problem.
+layer with ``_rebuild_layer``, which verifies the attach and the removal of
+the original so a failure never leaves zero or two copies. A rebuild gives
+the layer a new uuid, which the results report as ``layer_rebuilt``, and
+destroys child nodes (masks), so a layer that has any is refused. Box-fit
+trials run on a scratch vector layer that is discarded with
+``Node.remove()``; ``Node.remove()`` does not have the F31 problem.
 """
 
 import math
@@ -68,11 +70,26 @@ def _vector_layer(doc, ref):
     return node
 
 
+def _is_child(parent, node):
+    uuid = _o()._node_uuid(node)
+    for child in parent.childNodes():
+        if uuid:
+            if _o()._node_uuid(child) == uuid:
+                return True
+        elif child == node:
+            return True
+    return False
+
+
 def _new_vector_layer(doc, name):
     layer = doc.createVectorLayer(name)
     if layer is None:
         raise _err("Krita could not create a vector layer.")
-    _o()._insert_node(doc.rootNode(), layer, 0)
+    root = doc.rootNode()
+    _o()._insert_node(root, layer, 0)
+    if not _is_child(root, layer):
+        raise _err("Krita did not attach the new vector layer {0!r} to the "
+                   "document.".format(name), kind="internal")
     return layer
 
 
@@ -82,13 +99,83 @@ def _new_scratch_layer(doc):
 
 
 def _remove_layer(layer, purpose):
-    """Node.remove() a layer we created; never used on a user's layer."""
+    """Node.remove() a layer this module created (scratch, failed rebuild).
+
+    Returns True when Krita reports it removed; a False return or an
+    exception is logged and returns False so the caller can decide whether
+    the leftover is user-visible. Replacing a user's layer is
+    ``_rebuild_layer``'s job, never this function's.
+    """
     name = layer.name()
     try:
-        layer.remove()
+        removed = layer.remove()
     except Exception as exc:  # keep the operation's own error visible
         _o()._log("could not remove {0} layer {1!r}: {2}".format(
             purpose, name, exc))
+        return False
+    if removed is False:
+        _o()._log("Krita refused to remove {0} layer {1!r}".format(
+            purpose, name))
+        return False
+    return True
+
+
+def _refuse_children(layer, action):
+    """A vector-layer rebuild destroys masks; refuse before anything changes."""
+    children = list(layer.childNodes())
+    if children:
+        raise _err(
+            "Layer {0!r} has child node(s) {1}; {2} rebuilds the vector layer "
+            "and would destroy them. Nothing was changed. Delete or move the "
+            "child nodes first (delete_layer / move_layer), then retry and "
+            "re-create them.".format(
+                layer.name(),
+                ", ".join("{0!r} ({1})".format(c.name(), c.type())
+                          for c in children),
+                action))
+
+
+def _finite(value, key):
+    try:
+        number = _o()._as_float(value, key)
+    except OverflowError:
+        raise _err("{0} must be a finite number".format(key))
+    if not math.isfinite(number):
+        raise _err("{0} must be a finite number".format(key))
+    return number
+
+
+def _layer_snapshot(layer):
+    """(shape names, layer SVG) in ``layer.shapes()`` order.
+
+    Shapes are addressed by position, never by SVG id: Krita's export
+    uniquifies duplicate names ("x", "x1", "x2" for shapes named "x", "x1",
+    "x") while the import keeps ids verbatim, so the exported ids are written
+    back as the true names. The export must hold exactly one top-level
+    element per shape or the layer is refused.
+    """
+    names = [shape.name() for shape in layer.shapes()]
+    svg = layer.toSvg()
+    if not svg.strip():
+        if names:
+            raise _err("Krita reports {0} shapes on layer {1!r} but exports "
+                       "an empty SVG; nothing was changed. This is a Krita "
+                       "inconsistency -- reopen the document and retry."
+                       .format(len(names), layer.name()))
+        return names, ""
+    try:
+        root = svgshapes.parse_layer_svg(svg)
+        count = len(svgshapes.layer_shape_elements(root))
+        if count != len(names):
+            raise _err("Krita reports {0} shapes on layer {1!r} but exports "
+                       "{2} top-level shapes in its SVG; nothing was changed. "
+                       "This is a Krita inconsistency -- reopen the document "
+                       "and retry.".format(len(names), layer.name(), count))
+        svgshapes.set_root_shape_ids(root, names)
+    except svgshapes.LayerSvgError as exc:
+        raise _err("Could not read layer {0!r}'s SVG: {1}; nothing was "
+                   "changed.".format(layer.name(), exc))
+    return names, svgshapes.serialize_layer_svg(root)
 
 
 def _shape_entry(shape, units):
@@ -163,16 +250,16 @@ def _split_box(spec, index, key=None):
     for field in ("x", "y", "width", "height"):
         if field not in box:
             raise _err("{0}.box needs {1}".format(key, field))
-        rect.append(o._as_float(box[field], "{0}.box.{1}".format(key, field)))
+        rect.append(_finite(box[field], "{0}.box.{1}".format(key, field)))
     if rect[2] <= 0 or rect[3] <= 0:
         raise _err("{0}.box width and height must be positive".format(key))
     valign = layout.get("valign", "middle")
     if valign not in _VALIGN:
         raise _err("{0}.valign must be one of: {1}".format(
             key, ", ".join(_VALIGN)))
-    size = o._as_float(spec.get("size", 24), key + ".size")
-    min_size = o._as_float(layout.get("min_size", min(8.0, size)),
-                           key + ".min_size")
+    size = _finite(spec.get("size", 24), key + ".size")
+    min_size = _finite(layout.get("min_size", min(8.0, size)),
+                       key + ".min_size")
     if not 0 < min_size <= size:
         raise _err("{0}.min_size must be positive and at most size".format(key))
     for field in ("x", "y", "width"):
@@ -348,19 +435,49 @@ def _ui_index(parent, node):
     return 0
 
 
-def _rebuild_layer(doc, layer, svg):
+def _is_active(doc, layer):
+    try:
+        return doc.activeNode() == layer
+    except Exception:
+        return False
+
+
+def _discard_new_layer(parent, new_layer, name):
+    """Take back a rebuilt copy; raise if it cannot be removed."""
+    _remove_layer(new_layer, "incomplete rebuild")
+    try:
+        left = _is_child(parent, new_layer)
+    except Exception:
+        left = True
+    if left:
+        raise _err("Krita could not discard the incomplete rebuilt copy of "
+                   "layer {0!r}; the document now holds two layers named "
+                   "{0!r}. Delete the incomplete one (the one without all "
+                   "the shapes) with delete_layer.".format(name),
+                   kind="internal")
+
+
+def _rebuild_layer(doc, layer, svg, names):
     """Replace ``layer`` by a fresh vector layer holding ``svg``; return it.
 
+    ``names`` are the shape names the new layer must hold, in order.
     Shape.remove() is unusable (F31), so a layer edit is replayed as SVG.
     Names, types, stacking order (document order in the SVG) and bounds are
-    reproduced; the layer's uuid changes. On failure the fresh layer is
-    removed with Node.remove() and the original layer is left untouched.
+    reproduced; the layer's uuid changes. All or nothing: the fresh layer must
+    be attached and hold exactly ``names`` before the original is removed, and
+    the original must be gone afterwards. Any failure before that point
+    removes the fresh layer and leaves the original untouched.
     """
+    _refuse_children(layer, "a rebuild")
     try:
-        expected = (svgshapes.layer_shape_count(svg) if svg.strip() else 0)
+        count = (svgshapes.layer_shape_count(svg) if svg.strip() else 0)
     except svgshapes.LayerSvgError as exc:
         raise _err("Could not rebuild layer {0!r}: {1}; nothing was changed."
                    .format(layer.name(), exc))
+    if count != len(names):
+        raise _err("Could not rebuild layer {0!r}: the SVG holds {1} shapes "
+                   "but {2} were expected; nothing was changed.".format(
+                       layer.name(), count, len(names)))
     parent = _o()._parent_of(doc, layer)
     ui_index = _ui_index(parent, layer)
     new_layer = doc.createVectorLayer(layer.name())
@@ -369,12 +486,26 @@ def _rebuild_layer(doc, layer, svg):
                    .format(layer.name()))
     try:
         _o()._insert_node(parent, new_layer, ui_index)
-        shapes = list(new_layer.addShapesFromSvg(svg)) if expected else []
-        if len(shapes) != expected:
+        if not _is_child(parent, new_layer):
+            raise _err("Krita did not attach the rebuilt copy of layer {0!r}; "
+                       "the layer was left unchanged. Retry the call."
+                       .format(layer.name()), kind="internal")
+        shapes = list(new_layer.addShapesFromSvg(svg)) if names else []
+        got = [shape.name() for shape in new_layer.shapes()]
+        if got != names and len(got) == len(names):
+            # One import renames repeated ids (measured: "p", "p" -> "p",
+            # "p_40e972bd"), but a layer may legitimately hold two shapes
+            # with the same name; put the names back by position.
+            for shape, wanted in zip(new_layer.shapes(), names):
+                if shape.name() != wanted:
+                    shape.setName(wanted)
+            got = [shape.name() for shape in new_layer.shapes()]
+        if len(shapes) != len(names) or got != names:
             raise _err("Krita rebuilt {0} of {1} shapes of layer {2!r} from "
-                       "its own SVG; the layer was left unchanged. This is a "
-                       "Krita bug; retry the call.".format(
-                           len(shapes), expected, layer.name()))
+                       "its own SVG (names {3} instead of {4}); the layer was "
+                       "left unchanged. This is a Krita bug; retry the call."
+                       .format(len(shapes), len(names), layer.name(), got,
+                               names))
         new_layer.setOpacity(layer.opacity())
         new_layer.setVisible(layer.visible())
         new_layer.setBlendingMode(layer.blendingMode())
@@ -388,13 +519,32 @@ def _rebuild_layer(doc, layer, svg):
             raise _err("Krita refused to copy the layer style of {0!r}; the "
                        "layer was left unchanged.".format(layer.name()))
         new_layer.setLocked(layer.locked())
+        was_active = _is_active(doc, layer)
+        # Last step that can fail: nothing below may raise, or the cleanup
+        # would take the only remaining copy away.
+        try:
+            layer.remove()
+        except Exception as exc:
+            _o()._log("removing the original of rebuilt layer {0!r} "
+                      "raised: {1}".format(layer.name(), exc))
+        if _is_child(parent, layer):
+            raise _err("Krita could not remove the original layer {0!r}; the "
+                       "rebuilt copy was discarded and the layer was left "
+                       "unchanged.".format(layer.name()), kind="internal")
     except Exception:
-        _remove_layer(new_layer, "incomplete rebuild")
+        try:
+            original_present = _is_child(parent, layer)
+        except Exception:
+            original_present = True
+        if original_present:
+            _discard_new_layer(parent, new_layer, layer.name())
         raise
-    was_active = doc.activeNode() == layer
-    layer.remove()
     if was_active:
-        doc.setActiveNode(new_layer)
+        try:
+            doc.setActiveNode(new_layer)
+        except Exception as exc:  # the edit is applied; selection is cosmetic
+            _o()._log("could not re-select rebuilt layer {0!r}: {1}".format(
+                layer.name(), exc))
     return new_layer
 
 
@@ -515,11 +665,14 @@ def op_add_vector_shapes(params):
     boxed = [(i, spec, layout) for i, (spec, layout) in enumerate(split)
              if layout is not None]
     _check_specs(doc, plain, boxed, names)
+    if boxed and layer is not None:
+        _refuse_children(layer, "add_vector_shapes with a box")
 
     created_layer = layer is None
     if created_layer:
         layer = _new_vector_layer(doc, layer_name)
-    before_svg = None if created_layer else layer.toSvg()
+    before_names, before_svg = (None, None) if created_layer \
+        else _layer_snapshot(layer)
     units = _Units(doc)
     warnings = _font_warnings([s for s, _layout in split])
     results = [None] * len(split)
@@ -527,8 +680,10 @@ def op_add_vector_shapes(params):
     fitted = {}
     scratch = None
     rebuilt = False
+    mutated = False  # the user's layer was touched; rollback must rebuild it
     try:
         if plain:
+            mutated = True
             shapes, made = _add(doc, layer, [s for _i, s in plain], prefix)
             for (i, _spec), shape, shape_name in zip(plain, shapes, made):
                 actual[i] = shape_name
@@ -547,7 +702,7 @@ def op_add_vector_shapes(params):
             scratch_svg = scratch.toSvg()
             try:
                 scratch_root = svgshapes.parse_layer_svg(scratch_svg)
-                layer_svg = layer.toSvg()
+                names_now, layer_svg = _layer_snapshot(layer)
                 # An empty layer (new, or emptied) exports "".
                 root = (svgshapes.parse_layer_svg(layer_svg)
                         if layer_svg.strip()
@@ -559,9 +714,11 @@ def op_add_vector_shapes(params):
             except svgshapes.LayerSvgError as exc:
                 raise _err("Could not edit layer {0!r}'s SVG: {1}; the call "
                            "was rolled back.".format(layer.name(), exc))
-            layer = _rebuild_layer(doc, layer,
-                                   svgshapes.serialize_layer_svg(root))
+            layer = _rebuild_layer(
+                doc, layer, svgshapes.serialize_layer_svg(root),
+                names_now + [actual[i] for i, _spec, _layout in boxed])
             rebuilt = True
+            mutated = True
             by_name = {s.name(): s for s in layer.shapes()}
             for i in range(len(split)):
                 shape = by_name.get(actual[i])
@@ -577,15 +734,18 @@ def op_add_vector_shapes(params):
         # All or nothing: a half-lettered page is worse than a refusal.
         if created_layer:
             _remove_layer(layer, "rolled-back new")
-        elif before_svg is not None:
+        elif mutated and before_svg is not None:
             try:
-                _rebuild_layer(doc, layer, before_svg)
+                _rebuild_layer(doc, layer, before_svg, before_names)
             except Exception as exc:
                 o._log("rollback of add_vector_shapes failed: {0}".format(exc))
         raise
     finally:
-        if scratch is not None:
-            _remove_layer(scratch, "scratch")
+        scratch_gone = scratch is None or _remove_layer(scratch, "scratch")
+    if not scratch_gone:
+        raise _err("The shapes were added, but Krita could not remove the "
+                   "temporary layer 'mcp-scratch'; delete it with "
+                   "delete_layer.", kind="internal")
     o._refresh(doc)
     result = {"layer": layer.name(), "created_layer": created_layer,
               "layer_rebuilt": rebuilt, "shapes": results}
@@ -619,15 +779,22 @@ def op_update_vector_shapes(params):
     _check_specs(doc, plain, boxed, names,
                  labels=lambda i: "updates[{0}].shape".format(i))
 
-    before_svg = layer.toSvg()
+    shape_indexes = [i for i, item in enumerate(plan)
+                     if item["kind"] == "shape"]
+    before_names = before_svg = positions = None
+    if shape_indexes:
+        # Replacing a shape rebuilds the layer; a pure translate does not.
+        _refuse_children(layer, "update_vector_shapes with a replacement")
+        before_names, before_svg = _layer_snapshot(layer)
+        # Names are unique for every targeted shape (checked above), and the
+        # position in layer.shapes() is the key the SVG edit uses.
+        positions = {name: index for index, name in enumerate(before_names)}
     units = _Units(doc)
     warnings = _font_warnings([item["spec"] for item in plan
                                if item["kind"] == "shape"])
     results = [None] * len(plan)
     actual = list(names)
     fitted = {}
-    shape_indexes = [i for i, item in enumerate(plan)
-                     if item["kind"] == "shape"]
     scratch = None
     rebuilt = False
     translated = []
@@ -661,15 +828,16 @@ def op_update_vector_shapes(params):
                 scratch_root = svgshapes.parse_layer_svg(scratch_svg)
                 root = svgshapes.parse_layer_svg(before_svg)
                 for i in shape_indexes:
-                    svgshapes.replace_root_shape(
-                        root, names[i],
+                    svgshapes.replace_root_shape_at(
+                        root, positions[names[i]],
                         [svgshapes.root_shape_element(scratch_root,
                                                       actual[i])])
             except svgshapes.LayerSvgError as exc:
                 raise _err("Could not edit layer {0!r}'s SVG: {1}; the call "
                            "was rolled back.".format(layer.name(), exc))
             layer = _rebuild_layer(doc, layer,
-                                   svgshapes.serialize_layer_svg(root))
+                                   svgshapes.serialize_layer_svg(root),
+                                   before_names)
             rebuilt = True
         current = {s.name(): s for s in layer.shapes()}
         for i, item in enumerate(plan):
@@ -696,7 +864,7 @@ def op_update_vector_shapes(params):
     except Exception:
         if rebuilt:
             try:
-                _rebuild_layer(doc, layer, before_svg)
+                _rebuild_layer(doc, layer, before_svg, before_names)
             except Exception as exc:
                 o._log("rollback of update_vector_shapes failed: {0}".format(
                     exc))
@@ -709,8 +877,11 @@ def op_update_vector_shapes(params):
                         exc))
         raise
     finally:
-        if scratch is not None:
-            _remove_layer(scratch, "scratch")
+        scratch_gone = scratch is None or _remove_layer(scratch, "scratch")
+    if not scratch_gone:
+        raise _err("The shapes were updated, but Krita could not remove the "
+                   "temporary layer 'mcp-scratch'; delete it with "
+                   "delete_layer.", kind="internal")
     result = {"layer": layer.name(), "layer_rebuilt": rebuilt,
               "updated": results}
     if warnings:
@@ -737,6 +908,9 @@ def op_remove_vector_shapes(params):
     o = _o()
     doc = o.resolve_document(params.get("document"))
     layer = _vector_layer(doc, params.get("layer"))
+    if layer.locked():
+        raise _err("Layer {0!r} is locked; unlock it with set_layer first."
+                   .format(layer.name()))
     names = params.get("names")
     if not isinstance(names, list) or not names or \
             not all(isinstance(n, str) for n in names):
@@ -750,24 +924,19 @@ def op_remove_vector_shapes(params):
                    "list_vector_shapes for the names.".format(
                        ", ".join(repr(n) for n in missing), layer.name()),
                    kind="not_found")
-    wanted = list(dict.fromkeys(names))
-    shapes_in_order = list(layer.shapes())
-    svg = layer.toSvg()
-    svg_count = svgshapes.layer_shape_count(svg)
-    if svg_count != len(shapes_in_order):
-        raise _err("Krita reports {0} shapes on layer {1!r} but exports {2} "
-                   "top-level shapes in its SVG; nothing was removed. This is "
-                   "a Krita inconsistency -- reopen the document and retry."
-                   .format(len(shapes_in_order), layer.name(), svg_count))
-    wanted_set = set(wanted)
-    indexes = [i for i, shape in enumerate(shapes_in_order)
-               if shape.name() in wanted_set]
+    wanted = set(names)
+    _refuse_children(layer, "remove_vector_shapes")
+    shape_names, svg = _layer_snapshot(layer)
+    indexes = [i for i, name in enumerate(shape_names) if name in wanted]
     try:
         svg, removed = svgshapes.drop_layer_shapes_at(svg, indexes)
     except svgshapes.LayerSvgError as exc:
         raise _err("Could not edit layer {0!r}'s SVG: {1}; nothing was "
                    "removed.".format(layer.name(), exc))
-    layer = _rebuild_layer(doc, layer, svg)
+    kept = set(indexes)
+    layer = _rebuild_layer(
+        doc, layer, svg,
+        [name for i, name in enumerate(shape_names) if i not in kept])
     o._refresh(doc)
     return {"layer": layer.name(), "removed": removed,
             "remaining": len(layer.shapes()), "layer_rebuilt": True}

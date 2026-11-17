@@ -435,6 +435,42 @@ def drop_layer_shapes_at(svg, indexes):
     return serialize_layer_svg(root), dropped
 
 
+def set_root_shape_ids(root, names):
+    """Give the top-level shapes the ids ``names``, by position.
+
+    Krita's SVG export uniquifies ids ("x", "x1", "x2" for three shapes named
+    "x", "x1", "x"), so the exported ids are not the shape names. Writing the
+    true names (``VectorLayer.shapes()`` order) into the ids makes the SVG a
+    faithful description of the layer; vector_ops restores names that Krita's
+    import renames (repeated ids inside one import) with Shape.setName.
+    """
+    shapes = layer_shape_elements(root)
+    if len(shapes) != len(names):
+        raise LayerSvgError(
+            "layer SVG: {0} top-level shapes but {1} names".format(
+                len(shapes), len(names)))
+    for element, name in zip(shapes, names):
+        if element.get("id") != name:
+            element.set("id", name)
+
+
+def replace_root_shape_at(root, index, elements):
+    """Replace the top-level shape at position ``index`` with ``elements``."""
+    shapes = layer_shape_elements(root)
+    if not isinstance(index, int) or isinstance(index, bool) or \
+            not 0 <= index < len(shapes):
+        raise LayerSvgError(
+            "layer SVG: shape index {0!r} is out of range (0..{1})".format(
+                index, len(shapes) - 1))
+    replacements = [_copy_shape(element) for element in elements]
+    old = shapes[index]
+    position = list(root).index(old)
+    root.remove(old)
+    for offset, element in enumerate(replacements):
+        root.insert(position + offset, element)
+    return old
+
+
 def replace_root_shape(root, shape_id, elements):
     """Replace one top-level shape with ``elements`` at its position."""
     old = _root_shape(root, shape_id)

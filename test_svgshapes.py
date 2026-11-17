@@ -205,5 +205,34 @@ class SvgShapesTests(unittest.TestCase):
             self.assert_bad({"type": "bubble", "x": 0, "y": 0, "width": 400, "height": 200, field: value}, field)
 
 
+class LayerPositionTests(unittest.TestCase):
+    """Positional layer-SVG edits (Krita uniquifies exported ids)."""
+
+    SVG = ('<svg xmlns="http://www.w3.org/2000/svg"><defs/>'
+           '<rect id="x"/><rect id="x1"/><rect id="x11"/></svg>')
+
+    def test_set_root_shape_ids_restores_duplicate_names_by_position(self):
+        root = svgshapes.parse_layer_svg(self.SVG)
+        svgshapes.set_root_shape_ids(root, ["x", "x", "x1"])
+        self.assertEqual(svgshapes.layer_shape_ids(
+            svgshapes.serialize_layer_svg(root)), ["x", "x", "x1"])
+        with self.assertRaisesRegex(svgshapes.LayerSvgError, "3 top-level shapes but 2"):
+            svgshapes.set_root_shape_ids(root, ["x", "y"])
+
+    def test_replace_root_shape_at_targets_the_position_not_the_id(self):
+        root = svgshapes.parse_layer_svg(
+            '<svg xmlns="http://www.w3.org/2000/svg"><defs/><rect id="x"/>'
+            '<rect id="x"/><rect id="x1"/></svg>')
+        new = ET.fromstring('<rect xmlns="http://www.w3.org/2000/svg" id="x1" width="77"/>')
+        svgshapes.replace_root_shape_at(root, 2, [new])
+        shapes = svgshapes.layer_shape_elements(root)
+        self.assertEqual([e.get("id") for e in shapes], ["x", "x", "x1"])
+        self.assertEqual([e.get("width") for e in shapes], [None, None, "77"])
+        self.assertTrue(svgshapes._local_name(root[0].tag) == "defs")
+        for bad in (3, -1, True):
+            with self.assertRaisesRegex(svgshapes.LayerSvgError, "out of range"):
+                svgshapes.replace_root_shape_at(root, bad, [new])
+
+
 if __name__ == "__main__":
     unittest.main()

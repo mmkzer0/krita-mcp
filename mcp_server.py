@@ -906,7 +906,9 @@ TOOLS = [
          "one unless `layer` names an existing vector layer). Everything "
          "stays editable with Krita's text and shape tools. Returns each "
          "shape's name and its bounds in canvas pixels; text placed in a "
-         "`box` reports the font size it was fitted at.",
+         "`box` reports the font size it was fitted at. Boxed text on an "
+         "existing layer rebuilds it (new uuid) and is refused when the "
+         "layer has masks.",
          {"document": DOCUMENT_PROP,
           "layer": {"type": "string",
                     "description": "An existing vector layer; omit to "
@@ -929,7 +931,8 @@ TOOLS = [
          "otherwise nothing is removed. The layer is rebuilt from its SVG "
          "(Krita's per-shape removal is unsafe from scripts), which keeps "
          "its name, position, properties and layer style but changes its "
-         "uuid.",
+         "uuid. Refused on a locked layer or one with masks (a rebuild would "
+         "drop them).",
          {"document": DOCUMENT_PROP,
           "layer": {"type": "string"},
           "names": {"type": "array", "items": {"type": "string"},
@@ -943,7 +946,8 @@ TOOLS = [
          "by [dx, dy] canvas pixels. Everything is checked first, so a "
          "refusal changes nothing. Box-fitted text reports fitted_size. A "
          "replacement rebuilds the layer like remove_vector_shapes "
-         "(layer_rebuilt=true, new uuid); a translate does not.",
+         "(layer_rebuilt=true, new uuid; refused when the layer has masks); "
+         "a translate does not.",
          {"document": DOCUMENT_PROP,
           "layer": {"type": "string",
                     "description": "The vector layer holding the shapes."},
@@ -974,7 +978,10 @@ TOOLS = [
          "Put a checkpoint's pixels and layer properties back. The checkpoint "
          "stays, so restoring again works. Writes outside Krita's undo "
          "history. Layers deleted since come back as `missing` (not "
-         "recreated); layers added since are left alone (`added_since`).",
+         "recreated); layers added since are left alone (`added_since`). "
+         "Rebuilding a vector layer (update_vector_shapes, "
+         "remove_vector_shapes, boxed text added to an existing layer) gives "
+         "it a new uuid, so it then shows up as `missing` plus `added_since`.",
          {"document": DOCUMENT_PROP,
           "checkpoint": {"type": "string",
                          "description": "An id from checkpoint, e.g. cp3."}},
