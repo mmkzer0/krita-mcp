@@ -271,6 +271,44 @@ def _forget_viewless(doc):
             return
 
 
+def _autosave_files(doc):
+    """Where Krita would have autosaved this document (it may not have yet).
+
+    Mirrors KisDocument::generateAutoSaveFileName: a never-saved document
+    autosaves to ~/[.]krita-<pid>-<objectName>-autosave.kra (createDocument
+    sets objectName to the name), a saved one next to its file as
+    [.]<file name>-autosave.kra; the dot depends on a Krita setting.
+    """
+    path = doc.fileName()
+    if path:
+        folder, base = os.path.split(path)
+        names = ["{0}-autosave.kra".format(base)]
+    else:
+        folder = os.path.expanduser("~")
+        names = ["krita-{0}-{1}-autosave.kra".format(os.getpid(), doc.name())]
+    return [os.path.join(folder, prefix + name)
+            for name in names for prefix in (".", "")]
+
+
+def _remove_autosave_files(candidates):
+    """Do what Krita's own close-and-discard does (KisView::queryClose).
+
+    libkis Document.close() skips it, so an autosave written while the
+    document was open outlived it and came back as a recovered document on
+    the next start (F32).
+    """
+    removed = []
+    for path in candidates:
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                removed.append(path)
+        except OSError as exc:
+            _trace("close: could not remove autosave {0!r}: {1}".format(
+                path, exc))
+    return removed
+
+
 def _documents():
     _prune_viewless()
     return list(_krita().documents())
@@ -1053,14 +1091,19 @@ def op_close_document(params):
     # image scheduler, disabling autosave, clearing the modified flag,
     # collecting stale wrappers, saving first and pumping *after* the close
     # were all tried and none of them removed the fault.
+    autosaves = _autosave_files(doc)
     _trace("close: calling Document.close()")
     doc.close()
     _trace("close: close call returned")
     _settle_after_close()
     _forget_viewless(doc)
     history_ops.forget_closed_documents()
+    removed = _remove_autosave_files(autosaves)
     _trace("close: settled")
-    return {"closed": True, "document": summary}
+    result = {"closed": True, "document": summary}
+    if removed:
+        result["removed_autosave"] = removed
+    return result
 
 
 # --------------------------------------------------------------------------

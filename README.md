@@ -124,7 +124,7 @@ Restart the client. Krita must be running for the tools to do anything.
 | `inspect_document` | Canvas, colour space, full layer tree, selection |
 | `create_document` / `open_document` | Make or load a document |
 | `save_document` / `export_document` | Save in place or save-as; export to PNG/JPEG/etc. |
-| `close_document` | Close a document; Krita's pending canvas work is drained first (see *Known issue*) |
+| `close_document` | Close a document; Krita's pending canvas work is drained first (see *Known issue*), and the document's autosave file is removed so it does not come back as a recovered document |
 | `transform_image` | resize canvas, scale, rotate, crop, flatten; the size-changing ones need a view-less document (see *Known issue*) |
 | `create_layer` / `set_layer` / `delete_layer` | Layer stack management, incl. alpha lock, clipping (`clip_to_below`) and colour labels |
 | `duplicate_layer` / `move_layer` / `merge_layer_down` | Restacking and merging |
