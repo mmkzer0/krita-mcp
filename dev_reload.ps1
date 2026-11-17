@@ -30,14 +30,16 @@ Get-ChildItem $target -Filter '__pycache__' -Recurse -Directory -ErrorAction Sil
 
 $code = @'
 import importlib
-import krita_mcp.raster, krita_mcp.svgshapes, krita_mcp.imaging
-import krita_mcp.paint_ops, krita_mcp.vector_ops, krita_mcp.history_ops
-import krita_mcp.style_ops, krita_mcp.ops
+import krita_mcp.compat, krita_mcp.raster, krita_mcp.svgshapes
+import krita_mcp.imaging, krita_mcp.paint_ops, krita_mcp.vector_ops
+import krita_mcp.history_ops, krita_mcp.style_ops, krita_mcp.exchange_ops
+import krita_mcp.ops
 # Leaves first: ops re-registers the feature modules when it reloads.
 # Reloading history_ops drops every checkpoint.
-for module in (krita_mcp.raster, krita_mcp.svgshapes, krita_mcp.imaging,
-               krita_mcp.paint_ops, krita_mcp.vector_ops,
-               krita_mcp.history_ops, krita_mcp.style_ops, krita_mcp.ops):
+for module in (krita_mcp.compat, krita_mcp.raster, krita_mcp.svgshapes,
+               krita_mcp.imaging, krita_mcp.paint_ops, krita_mcp.vector_ops,
+               krita_mcp.history_ops, krita_mcp.style_ops,
+               krita_mcp.exchange_ops, krita_mcp.ops):
     importlib.reload(module)
 result = {"operations": len(krita_mcp.ops.OPS),
           "plugin_version": krita_mcp.ops.PLUGIN_VERSION}

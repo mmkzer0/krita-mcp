@@ -139,6 +139,7 @@ Restart the client. Krita must be running for the tools to do anything.
 | `fill` | Fill or erase the selection (or a region) on a paint layer |
 | `checkpoint` / `restore` / `list_checkpoints` / `drop_checkpoints` | In-memory snapshot of a document's layer pixels and properties; `restore` puts them back, also on view-less documents |
 | `set_layer_style` / `get_layer_style` | Outline (stroke) and drop shadow as a real Krita layer style, for SFX and lettering |
+| `export_region` / `import_region` | Hand a region to an outside tool (inpainting, an image editor) as a PNG file and paste the patched file back by path, aligned, optionally only inside the selection |
 | `list_capabilities` | Filters and their parameters, blending modes, installed fonts, brush presets |
 | `trigger_action` | Fire a Krita menu action by id (`edit_undo`, …) on the *active* document; script-running actions are refused while `run_python` is off (see *Arbitrary Python is opt-in*) |
 | `run_python` | Arbitrary Python inside Krita, full libkis access — **off by default** |
@@ -447,6 +448,7 @@ python test_gate.py            # the Python gate policy
 python test_schema.py          # argument validation at the MCP boundary
 python test_history.py         # checkpoint store: ids, budget, eviction
 python test_style.py           # layer style ASL builder and parser
+python test_exchange.py        # region export/import: paths, padding, placement
 python test_raster.py          # magic wand / hole filling on raw pixels
 python test_svgshapes.py       # text, bubble and shape SVG generation
 python test_vector_update.py   # vector update planning, layer SVG editing
@@ -514,6 +516,7 @@ pykrita/
     svgshapes.py           shape specs -> SVG, layer SVG editing (pure, Krita-free)
     history_ops.py         checkpoint / restore of layer pixels and properties
     style_ops.py           layer styles (stroke, drop shadow) as Krita ASL
+    exchange_ops.py        region export/import by file path (inpainting hand-off)
     raster.py              magic wand / hole filling on pixel buffers (pure)
     imaging.py             QImage <-> Krita pixels, colour parsing, grid
 ```

@@ -1010,6 +1010,68 @@ TOOLS = [
          {"document": DOCUMENT_PROP, "layer": LAYER_PROP},
          required=["layer"]),
 
+    tool("export_region",
+         "Write a canvas region to a PNG file that an outside tool (an "
+         "inpainting model, an image editor) can patch, then paste back with "
+         "import_region -- no base64 image data in the conversation. Omit "
+         "`layer` for the merged image (the page as it renders, not the "
+         "active layer); pass one for that layer's own pixels (RGBA/U8 "
+         "only). `pad` adds context on every side, clamped to the canvas. The "
+         "returned region is the rect actually exported, so import it back at "
+         "region.x/region.y. Refuses a relative path, a non-.png extension, "
+         "an existing file without overwrite=true, a missing directory (it "
+         "does not create one), a region off the canvas, and more than 64 "
+         "megapixels. Reads only.",
+         {"document": DOCUMENT_PROP,
+          "region": REGION_PROP,
+          "layer": LAYER_PROP,
+          "path": {"type": "string",
+                   "description": "Absolute path of the .png to write."},
+          "pad": {"type": "integer", "minimum": 0, "maximum": 1024,
+                  "default": 0,
+                  "description": "Extra context in pixels on every side, "
+                                 "clamped to the canvas."},
+          "overwrite": {"type": "boolean", "default": False,
+                        "description": "Replace the file if it already "
+                                       "exists."}},
+         required=["region", "path"]),
+
+    tool("import_region",
+         "Paste a PNG/JPEG/WebP file into a paint layer at a canvas position "
+         "-- the return half of export_region. `x`/`y` are the canvas pixels "
+         "of the image's top-left corner, typically the exported region's "
+         "x/y. mode over (default) alpha-composites onto the layer; replace "
+         "writes the image's pixels as they are, transparency included, and "
+         "is refused on an alpha-locked layer (over keeps the layer's alpha, "
+         "like fill). selection_only limits the change to the current "
+         "selection, weighted by its coverage, and needs a selection. Pixels "
+         "outside the canvas are clipped and reported, not refused; images "
+         "over 64 megapixels are refused before decoding. Writes pixels "
+         "directly, which Krita's undo does not record: take a checkpoint "
+         "first.",
+         {"document": DOCUMENT_PROP,
+          "layer": LAYER_PROP,
+          "path": {"type": "string",
+                   "description": "Absolute path of the .png/.jpg/.jpeg/"
+                                  ".webp to paste."},
+          "x": {"type": "integer",
+                "description": "Canvas x of the image's top-left corner."},
+          "y": {"type": "integer",
+                "description": "Canvas y of the image's top-left corner."},
+          "mode": {"type": "string", "enum": ["over", "replace"],
+                   "default": "over",
+                   "description": "over alpha-composites; replace overwrites "
+                                  "pixels, transparency included."},
+          "selection_only": {"type": "boolean", "default": False,
+                             "description": "Change only pixels inside the "
+                                            "current selection, weighted by "
+                                            "its coverage."},
+          "expect_size": {"type": "array", "items": {"type": "integer"},
+                          "minItems": 2, "maxItems": 2,
+                          "description": "Required [width, height] of the "
+                                         "image; refuse a size mismatch."}},
+         required=["layer", "path", "x", "y"]),
+
     tool("list_capabilities",
          "List what this Krita build supports: filter names (with their "
          "parameters), blending modes, installed fonts or brush presets.",
