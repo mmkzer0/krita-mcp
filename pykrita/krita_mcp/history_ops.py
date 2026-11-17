@@ -28,8 +28,10 @@ document (only view-less documents open) it dereferences null and kills Krita
 (F31, crash report krita-2026-11-17-194121.ips).
 """
 
+import math
 import os
 import time
+from fractions import Fraction
 
 CHECKPOINT_MB_ENV = "KRITA_MCP_CHECKPOINT_MB"
 DEFAULT_LIMIT_MB = 1024
@@ -60,29 +62,17 @@ def parse_limit_mb(text):
         megabytes = float(text)
     except (TypeError, ValueError):
         megabytes = None
-    if megabytes is None or megabytes != megabytes or megabytes <= 0:
+    if megabytes is None or not math.isfinite(megabytes) or megabytes <= 0:
         raise StoreError(
-            "{0} must be a positive number of megabytes, got {1!r}. Unset it "
-            "for the default of {2} MB.".format(
+            "{0} must be a positive, finite number of megabytes, got {1!r}. "
+            "Unset it for the default of {2} MB.".format(
                 CHECKPOINT_MB_ENV, text, DEFAULT_LIMIT_MB))
-    return int(megabytes * 1024 * 1024)
+    # Exact arithmetic: float * 2**20 overflows to inf for huge finite values.
+    return int(Fraction(megabytes) * 1024 * 1024)
 
 
 def rect_is_empty(rect):
     return rect is None or rect[2] <= 0 or rect[3] <= 0
-
-
-def rect_union(a, b):
-    """Bounding rectangle of two (x, y, w, h) tuples; empties are ignored."""
-    if rect_is_empty(a):
-        return None if rect_is_empty(b) else tuple(b)
-    if rect_is_empty(b):
-        return tuple(a)
-    left = min(a[0], b[0])
-    top = min(a[1], b[1])
-    right = max(a[0] + a[2], b[0] + b[2])
-    bottom = max(a[1] + a[3], b[1] + b[3])
-    return (left, top, right - left, bottom - top)
 
 
 def rect_contains(outer, inner):
@@ -146,8 +136,13 @@ class CheckpointStore(object):
                                        CHECKPOINT_MB_ENV),
                 kind="too_large")
 
-    def add(self, doc_key, label, size, layers, data):
-        """Store a checkpoint; returns (checkpoint, [evicted ids])."""
+    def reserve(self, doc_key, size):
+        """Evict until a checkpoint of ``size`` bytes fits; returns the ids.
+
+        The plugin calls this before it reads any pixels, so the new data and
+        the old checkpoints never coexist beyond the budget. Refuses, with
+        nothing evicted, what cannot fit even in an empty store.
+        """
         self.check_fits(size)
         evicted = []
         while sum(1 for c in self._items.values()
@@ -156,6 +151,14 @@ class CheckpointStore(object):
                 c for c in self._items.values() if c.doc_key == doc_key)))
         while self._used + size > self.limit_bytes:
             evicted.append(self._evict(next(iter(self._items.values()))))
+        return evicted
+
+    def add(self, doc_key, label, size, layers, data):
+        """Store a checkpoint; returns (checkpoint, [ids evicted for it]).
+
+        Evicts whatever ``reserve`` has not already made room for.
+        """
+        evicted = self.reserve(doc_key, size)
         checkpoint = Checkpoint(self._next, doc_key, label,
                                 int(self._clock()), size, layers, data)
         self._next += 1
@@ -253,27 +256,58 @@ def _apply_limit():
         raise _err(str(exc), exc.kind)
 
 
-def _doc_key(doc):
-    """A document's identity that outlives its Python wrapper: root uuid."""
-    key = _o()._node_uuid(doc.rootNode())
+def _root_key(doc):
+    """A document's identity that outlives its Python wrapper: root uuid.
+
+    None when Krita gives the document no root layer or no uuid.
+    """
+    root = doc.rootNode()
+    return _o()._node_uuid(root) if root is not None else None
+
+
+def _open_docs():
+    """{key: [documents]} for every open document that has an identity."""
+    found = {}
+    for doc in _o()._documents():
+        key = _root_key(doc)
+        if key:
+            found.setdefault(key, []).append(doc)
+    return found
+
+
+def _unique_key(doc, open_docs):
+    """``doc``'s key, refusing documents the key cannot tell apart."""
+    key = _root_key(doc)
     if not key:
-        raise _err("Krita gave the document's root layer no uuid, so it "
+        raise _err("Krita gave this document's root layer no uuid, so it "
                    "cannot be checkpointed.", kind="unsupported")
+    if len(open_docs.get(key, ())) > 1:
+        raise _err("Two open documents share one internal id (a duplicated "
+                   "document), so checkpoints cannot tell them apart. Close "
+                   "one of them first.", kind="ambiguous")
     return key
 
 
-def _open_keys():
-    return [_doc_key(d) for d in _o()._documents()]
+def _prune():
+    """Forget checkpoints of closed documents; returns ``_open_docs()``."""
+    open_docs = _open_docs()
+    _STORE.forget_closed(open_docs)
+    return open_docs
 
 
 def forget_closed_documents():
     """Drop the checkpoints of documents that are no longer open.
 
-    Called by close_document once the close has returned; also catches
-    documents closed by hand. Skips Krita entirely when nothing is stored.
+    Called by close_document once the close has returned, where an error must
+    not turn a finished close into a failure: it is logged instead. Skips
+    Krita entirely when nothing is stored.
     """
-    if len(_STORE):
-        _STORE.forget_closed(_open_keys())
+    if not len(_STORE):
+        return
+    try:
+        _prune()
+    except Exception as exc:
+        _o()._log("checkpoint cleanup after close failed: {0!r}".format(exc))
 
 
 def _walk(node, prefix):
@@ -365,6 +399,7 @@ def op_checkpoint(params):
     (kind ``too_large``) before anything is stored or read.
     """
     o = _o()
+    open_docs = _prune()
     doc = o.resolve_document(params.get("document"))
     label = o._arg(params, "label", "")
     if not isinstance(label, str):
@@ -372,6 +407,7 @@ def op_checkpoint(params):
     if len(label) > MAX_LABEL_CHARS:
         raise _err("label is {0} characters; the limit is {1}.".format(
             len(label), MAX_LABEL_CHARS))
+    key = _unique_key(doc, open_docs)
     _apply_limit()
 
     members = _select_nodes(doc, params.get("layers"))
@@ -388,8 +424,9 @@ def op_checkpoint(params):
             skipped.append({"layer": path, "reason": plan["reason"]})
 
     total = sum(plan["size"] for _node, plan in plans)
+    # Make room before any pixel is read: the budget bounds peak memory.
     try:
-        _STORE.check_fits(total)
+        evicted = _STORE.reserve(key, total)
     except StoreError as exc:
         raise _err(str(exc), exc.kind)
     for node, plan in plans:
@@ -400,12 +437,9 @@ def op_checkpoint(params):
                       if o._node_uuid(n))
     saved = [{k: v for k, v in plan.items() if k not in ("reason", "size")}
              for _node, plan in plans]
-    try:
-        checkpoint, evicted = _STORE.add(
-            _doc_key(doc), label, total, len(saved),
-            {"layers": saved, "known": known})
-    except StoreError as exc:
-        raise _err(str(exc), exc.kind)
+    checkpoint, late = _STORE.add(key, label, total, len(saved),
+                                  {"layers": saved, "known": known})
+    evicted += late
     return {"checkpoint": checkpoint.id, "document": doc.name(),
             "label": label,
             "layers": [{"name": s["name"], "uuid": s["uuid"],
@@ -443,18 +477,23 @@ def op_restore(params):
     checkpoint_id = o._req(params, "checkpoint")
     if not isinstance(checkpoint_id, str):
         raise _err("checkpoint must be a checkpoint id such as 'cp1'")
-    open_docs = {_doc_key(d): d for d in o._documents()}
-    _STORE.forget_closed(open_docs)
+    open_docs = _prune()
     checkpoint = _STORE.get(checkpoint_id)
     if checkpoint is None:
         raise _err("No checkpoint {0!r}: it was never made, was dropped or "
                    "evicted, or its document was closed. list_checkpoints "
                    "shows what exists.".format(checkpoint_id),
                    kind="not_found")
-    doc = open_docs[checkpoint.doc_key]
+    candidates = open_docs[checkpoint.doc_key]
+    if len(candidates) > 1:
+        raise _err("Checkpoint {0!r} belongs to a document that now shares "
+                   "its internal id with another open document (a duplicate), "
+                   "so it cannot be restored safely. Close the duplicate "
+                   "first.".format(checkpoint_id), kind="ambiguous")
+    doc = candidates[0]
     if params.get("document") not in (None, ""):
         given = o.resolve_document(params["document"])
-        if _doc_key(given) != checkpoint.doc_key:
+        if _unique_key(given, open_docs) != checkpoint.doc_key:
             raise _err(
                 "Checkpoint {0!r} belongs to document {1!r}, not {2!r}. Omit "
                 "`document` or pass the right one.".format(
@@ -486,10 +525,13 @@ def op_restore(params):
         else:
             targets.append((node, layer))
 
-    # Pixels before properties: a layer that was locked at the checkpoint is
-    # locked again only after its pixels are back.
+    # Pixels before properties, and unlocked meanwhile: a layer locked after
+    # the checkpoint must take the pixel write, and the saved ``locked`` flag
+    # comes back with the rest of the properties.
     for node, layer in targets:
         if layer["saved"] == "pixels":
+            if node.locked():
+                node.setLocked(False)
             _restore_pixels(node, layer["rect"], layer["pixels"])
         _apply_props(node, layer["type"], layer["props"])
     o._refresh(doc)
@@ -504,14 +546,15 @@ def op_restore(params):
 def op_list_checkpoints(params):
     """List a document's checkpoints and the shared memory budget."""
     o = _o()
+    open_docs = _prune()
     doc = o.resolve_document(params.get("document"))
+    key = _unique_key(doc, open_docs)
     _apply_limit()
-    _STORE.forget_closed(_open_keys())
     name = doc.name()
     return {"checkpoints": [
         {"checkpoint": c.id, "document": name, "label": c.label,
          "created": c.created, "layers": c.layers, "bytes": c.size}
-        for c in _STORE.list(_doc_key(doc))],
+        for c in _STORE.list(key)],
         "budget": {"used_bytes": _STORE.used_bytes,
                    "limit_bytes": _STORE.limit_bytes}}
 
@@ -519,6 +562,7 @@ def op_list_checkpoints(params):
 def op_drop_checkpoints(params):
     """Drop checkpoints to free memory: the given ids, or all of the document's."""
     o = _o()
+    open_docs = _prune()
     doc = o.resolve_document(params.get("document"))
     ids = params.get("checkpoints")
     if ids is not None and (not isinstance(ids, list) or not ids or
@@ -526,7 +570,7 @@ def op_drop_checkpoints(params):
         raise _err("`checkpoints` must be a non-empty array of checkpoint "
                    "ids; omit it to drop all of the document's.")
     try:
-        return {"dropped": _STORE.drop(_doc_key(doc), ids)}
+        return {"dropped": _STORE.drop(_unique_key(doc, open_docs), ids)}
     except StoreError as exc:
         raise _err(str(exc), exc.kind)
 

@@ -177,6 +177,41 @@ class StoreTests(unittest.TestCase):
         _, evicted = put(store, "a", 0)
         self.assertEqual(evicted, [])
 
+    def test_reserve_evicts_before_the_checkpoint_exists(self):
+        store = make(limit=100)
+        put(store, "a", 40)
+        put(store, "b", 40)
+        evicted = store.reserve("c", 50)
+        self.assertEqual(evicted, ["cp1"])
+        # room is made now, with the new checkpoint not yet stored
+        self.assertEqual(store.used_bytes, 40)
+        self.assertEqual(len(store), 1)
+        checkpoint, late = store.add("c", "", 50, 1, None)
+        self.assertEqual((checkpoint.id, late), ("cp3", []))
+        self.assertEqual(store.used_bytes, 90)
+
+    def test_reserve_applies_the_per_document_cap_first(self):
+        store = make(limit=1000, per_document=2)
+        put(store, "a", 10)
+        put(store, "b", 10)
+        put(store, "a", 10)
+        self.assertEqual(store.reserve("a", 10), ["cp1"])
+        self.assertEqual(len(store.list("a")), 1)
+
+    def test_reserve_refuses_too_large_without_evicting(self):
+        store = make(limit=100)
+        put(store, "a", 60)
+        with self.assertRaises(history.StoreError) as caught:
+            store.reserve("a", 101)
+        self.assertEqual(caught.exception.kind, "too_large")
+        self.assertEqual((len(store), store.used_bytes), (1, 60))
+
+    def test_reserve_that_already_fits_evicts_nothing(self):
+        store = make(limit=100)
+        put(store, "a", 40)
+        self.assertEqual(store.reserve("a", 60), [])
+        self.assertEqual(len(store), 1)
+
 
 class HelperTests(unittest.TestCase):
     def test_limit_parsing(self):
@@ -184,17 +219,17 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(history.parse_limit_mb(""), 1024 * MB)
         self.assertEqual(history.parse_limit_mb("2"), 2 * MB)
         self.assertEqual(history.parse_limit_mb("0.5"), MB // 2)
-        for bad in ("zero", "0", "-3", "nan", "inf x"):
+        for bad in ("zero", "0", "-3", "nan", "inf", "-inf", "1e400",
+                    "inf x"):
             with self.assertRaises(history.StoreError) as caught:
                 history.parse_limit_mb(bad)
             self.assertIn(history.CHECKPOINT_MB_ENV, str(caught.exception))
+            self.assertIn("finite", str(caught.exception))
 
-    def test_rect_union_ignores_empties(self):
-        self.assertIsNone(history.rect_union(None, (0, 0, 0, 5)))
-        self.assertEqual(history.rect_union((1, 2, 3, 4), None), (1, 2, 3, 4))
-        self.assertEqual(history.rect_union(None, (1, 2, 3, 4)), (1, 2, 3, 4))
-        self.assertEqual(history.rect_union((0, 0, 10, 10), (20, -5, 5, 5)),
-                         (0, -5, 25, 15))
+    def test_limit_parsing_survives_huge_finite_values(self):
+        limit = history.parse_limit_mb("1e308")
+        self.assertIsInstance(limit, int)
+        self.assertGreater(limit, 10 ** 300)
 
     def test_rect_contains(self):
         outer = (0, 0, 10, 10)
