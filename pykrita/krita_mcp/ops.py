@@ -46,7 +46,7 @@ from .gate import (ENV_VAR, Gate, SETTING_KEY, UNSET, runs_code, summary,
                    truthy)
 from .imaging import ImagingError, parse_color
 
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.0"
 
 # Escape hatch for the size-changing operations. Krita 5.3.4 aborts in its own
 # canvas code when a document changes size under a view (see _refuse_on_view),
@@ -427,6 +427,9 @@ def _node_entry(node, path, index_path, index, active_uuid, active_name):
         "color_model": node.colorModel(),
         "color_depth": node.colorDepth(),
         "animated": bool(node.animated()),
+        "alpha_lock": bool(node.alphaLocked()),
+        "clip_to_below": bool(node.inheritAlpha()),
+        "color_label": int(node.colorLabel()),
     }
     if uuid:
         entry["uuid"] = uuid
@@ -1154,16 +1157,41 @@ _LAYER_TYPES = {
     "grouplayer": "grouplayer",
     "group": "grouplayer",
     "filelayer": "filelayer",
-    "filterlayer": "filterlayer",
+    # No "filterlayer": createNode() makes one without a filter, and a
+    # document holding it killed Krita 5.3.4 (exit 139, F28).
     "filllayer": "filllayer",
     "clonelayer": "clonelayer",
     "vectorlayer": "vectorlayer",
+    # Filter, transform and colorize masks need configuration createNode()
+    # cannot give them; transparency and selection masks are initialised by
+    # _create_mask.
     "transparencymask": "transparencymask",
-    "filtermask": "filtermask",
-    "transformmask": "transformmask",
     "selectionmask": "selectionmask",
-    "colorizemask": "colorizemask",
 }
+
+
+def _create_mask(doc, name, node_type):
+    """A mask with a selection, as Krita's own "Add mask" makes it.
+
+    ``createNode("transparencymask")`` returns a mask with no selection, and
+    saving a document holding one killed Krita 5.3.4 (exit 139, reproduced
+    with tmp/probe-save-crash-2026-11-17.py). Start from the document's
+    selection, or reveal everything when there is none.
+    """
+    from krita import Selection
+    create = {"transparencymask": doc.createTransparencyMask,
+              "selectionmask": doc.createSelectionMask}[node_type]
+    mask = create(name)
+    if mask is None:
+        return None
+    current = doc.selection()
+    if current is not None:
+        selection = current.duplicate()
+    else:
+        selection = Selection()
+        selection.select(0, 0, doc.width(), doc.height(), 255)
+    mask.setSelection(selection)
+    return mask
 
 
 @op("create_layer", timeout=60.0, mutates=True)
@@ -1176,21 +1204,31 @@ def op_create_layer(params):
             raw_type, ", ".join(sorted(set(_LAYER_TYPES.values())))))
     node_type = _LAYER_TYPES[raw_type]
 
+    parent_ref = params.get("parent")
+    is_mask = node_type.endswith("mask")
+    if is_mask and parent_ref in (None, ""):
+        raise OpError("A {0} applies to a layer: pass that layer as "
+                      "`parent`.".format(node_type))
+    parent = (resolve_node(doc, parent_ref, allow_root=True)
+              if parent_ref not in (None, "") else doc.rootNode())
+
     if node_type == "grouplayer":
         node = doc.createGroupLayer(name)
+    elif is_mask:
+        node = _create_mask(doc, name, node_type)
     else:
         node = doc.createNode(name, node_type)
     if node is None:
         raise OpError("Krita could not create a {0} named {1!r}.".format(
             node_type, name))
-
-    parent_ref = params.get("parent")
-    parent = (resolve_node(doc, parent_ref, allow_root=True)
-              if parent_ref not in (None, "") else doc.rootNode())
-    if parent_ref not in (None, "") and parent.type() != "grouplayer" \
-            and parent is not doc.rootNode():
-        raise OpError("parent {0!r} is a {1}; layers can only be nested inside "
-                      "a group layer.".format(parent_ref, parent.type()))
+    if parent_ref not in (None, "") and parent is not doc.rootNode():
+        if is_mask and parent.type().endswith("mask"):
+            raise OpError("parent {0!r} is a mask; a mask goes on a layer."
+                          .format(parent_ref))
+        if not is_mask and parent.type() != "grouplayer":
+            raise OpError("parent {0!r} is a {1}; layers can only be nested "
+                          "inside a group layer (masks go on any layer)."
+                          .format(parent_ref, parent.type()))
 
     sibling_count = len(_children(parent))
     index = params.get("index")
@@ -1259,6 +1297,27 @@ def _apply_layer_properties(node, params):
     if "new_name" in params and params["new_name"]:
         node.setName(str(params["new_name"]))
         changed.append("name")
+    if "alpha_lock" in params and params["alpha_lock"] is not None:
+        if node.type() != "paintlayer":
+            # Krita only honours the flag on paint layers; say so instead of
+            # reporting a change that did not happen.
+            warnings.append("alpha_lock applies to paint layers only; {0!r} "
+                            "is a {1}.".format(node.name(), node.type()))
+        else:
+            node.setAlphaLocked(_as_bool(params["alpha_lock"], "alpha_lock"))
+            changed.append("alpha_lock")
+    if "clip_to_below" in params and params["clip_to_below"] is not None:
+        # Krita's "inherit alpha": the layer only shows where the layers
+        # below it in the same group have pixels -- a clipping layer.
+        node.setInheritAlpha(_as_bool(params["clip_to_below"],
+                                      "clip_to_below"))
+        changed.append("clip_to_below")
+    if "color_label" in params and params["color_label"] is not None:
+        label = _as_int(params["color_label"], "color_label")
+        if not 0 <= label <= 8:
+            raise OpError("color_label must be 0 (none) to 8")
+        node.setColorLabel(label)
+        changed.append("color_label")
     return changed, warnings
 
 
@@ -1425,7 +1484,35 @@ def op_get_image(params):
 
     max_size = _as_int(_arg(params, "max_size", 1024), "max_size")
     max_size = max(0, min(4096, max_size))
-    scaled, factor = imaging.scale_to_fit(image, max_size)
+    zoom = None
+    if params.get("zoom") is not None:
+        zoom = _as_int(params["zoom"], "zoom")
+        if not 1 <= zoom <= 16:
+            raise OpError("zoom must be between 1 and 16")
+    if zoom is not None:
+        # An explicit zoom, 1 included, means "exactly this scale": it
+        # overrides max_size. Nearest-neighbour keeps every pixel a square.
+        if max(image.width(), image.height()) * zoom > 4096:
+            raise OpError(
+                "zoom {0} would return {1}x{2} pixels; the limit is 4096 on "
+                "the longest edge. Pass a smaller region.".format(
+                    zoom, image.width() * zoom, image.height() * zoom))
+        scaled = image if zoom == 1 else image.scaled(
+            image.width() * zoom, image.height() * zoom,
+            Qt.IgnoreAspectRatio, Qt.FastTransformation)
+        factor = float(zoom)
+    else:
+        scaled, factor = imaging.scale_to_fit(image, max_size)
+    grid = params.get("grid")
+    if grid is not None:
+        spacing = _as_int(grid, "grid")
+        if spacing < 4:
+            raise OpError("grid spacing must be at least 4 canvas pixels")
+        try:
+            scaled = imaging.draw_grid(scaled, rect.x(), rect.y(), factor,
+                                       spacing)
+        except imaging.ImagingError as exc:
+            raise OpError(str(exc))
 
     result = {
         "source": source,
@@ -1435,6 +1522,8 @@ def op_get_image(params):
         "scale": round(factor, 6),
         "document": _doc_summary(doc),
     }
+    if grid is not None:
+        result["grid"] = spacing
     if _as_bool(_arg(params, "include_data", True), "include_data"):
         result["png_base64"] = imaging.qimage_to_png_b64(scaled)
     return result
@@ -1878,28 +1967,26 @@ def op_apply_filter(params):
     return result
 
 
-@op("set_selection", timeout=30.0, mutates=True)
+_MASK_MODES = ("ellipse", "polygon", "contiguous", "color", "layer_alpha")
+_SELECTION_MODES = ("rect", "all", "none", "invert", "grow", "shrink",
+                    "feather", "border", "smooth", "fill_holes") + _MASK_MODES
+
+
+@op("set_selection", timeout=60.0, mutates=True)
 def op_set_selection(params):
     from krita import Selection
 
     doc = resolve_document(params.get("document"))
     mode = str(_arg(params, "mode", "rect")).lower()
+    combine = str(_arg(params, "combine", "replace")).lower()
+    if _as_bool(_arg(params, "add", False), "add"):
+        combine = "add"
+    details = {}
 
     if mode in ("none", "deselect", "clear"):
-        cleared = False
-        action = _krita().action("deselect")
-        if action is not None:
-            action.trigger()
-            cleared = True
-        else:
-            try:
-                doc.setSelection(None)
-                cleared = True
-            except Exception:
-                pass
-        if not cleared:
-            raise OpError("Could not clear the selection; no Krita window is "
-                          "available to run the deselect action.")
+        # Per document: Krita's `deselect` action acts on whichever document
+        # is active, which is not necessarily this one (F20).
+        doc.setSelection(None)
         _refresh(doc)
         return {"selection": None}
 
@@ -1914,33 +2001,41 @@ def op_set_selection(params):
         width = _as_int(_req(params, "width"), "width")
         height = _as_int(_req(params, "height"), "height")
         value = max(0, min(255, _as_int(_arg(params, "value", 255), "value")))
-        if not _as_bool(_arg(params, "add", False), "add") or selection is None:
-            selection = Selection()
-        selection.select(x, y, width, height, value)
-        doc.setSelection(selection)
-    elif mode in ("invert", "grow", "shrink", "feather"):
+        new = Selection()
+        new.select(x, y, width, height, value)
+        paint_ops.combine_selection(doc, new, combine)
+    elif mode in _MASK_MODES:
+        new, details = paint_ops.build_mask_selection(doc, mode, params)
+        paint_ops.combine_selection(doc, new, combine)
+    elif mode == "fill_holes":
+        details = {"added_pixels": paint_ops.fill_selection_holes(doc)}
+    elif mode in ("invert", "grow", "shrink", "feather", "border", "smooth"):
         if selection is None:
             raise OpError("There is no selection to {0}.".format(mode))
+        amount = _as_int(_arg(params, "amount", 1), "amount")
         if mode == "invert":
             selection.invert()
         elif mode == "grow":
-            amount = _as_int(_arg(params, "amount", 1), "amount")
             selection.grow(amount, amount)
         elif mode == "shrink":
-            amount = _as_int(_arg(params, "amount", 1), "amount")
             selection.shrink(amount, amount, True)
+        elif mode == "feather":
+            selection.feather(amount)
+        elif mode == "border":
+            selection.border(amount, amount)
         else:
-            selection.feather(_as_int(_arg(params, "amount", 1), "amount"))
+            selection.smooth()
         doc.setSelection(selection)
     else:
-        raise OpError("mode must be one of: rect, all, none, invert, grow, "
-                      "shrink, feather")
+        raise OpError("mode must be one of: " + ", ".join(_SELECTION_MODES))
 
     _refresh(doc)
     current = doc.selection()
-    return {"selection": None if current is None else {
+    result = {"selection": None if current is None else {
         "x": current.x(), "y": current.y(),
         "width": current.width(), "height": current.height()}}
+    result.update(details)
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -2184,3 +2279,11 @@ def dispatch(name, params):
 def op_timeout(name, default=30.0):
     handler = OPS.get(name)
     return getattr(handler, "op_timeout", default) if handler else default
+
+
+# Registered last, so a reload of this module re-registers them into the
+# fresh OPS together with everything above.
+from . import paint_ops, vector_ops  # noqa: E402
+
+paint_ops.register(op)
+vector_ops.register(op)

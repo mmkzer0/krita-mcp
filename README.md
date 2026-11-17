@@ -124,19 +124,28 @@ Restart the client. Krita must be running for the tools to do anything.
 | `inspect_document` | Canvas, colour space, full layer tree, selection |
 | `create_document` / `open_document` | Make or load a document |
 | `save_document` / `export_document` | Save in place or save-as; export to PNG/JPEG/etc. |
-| `close_document` | Close a document (see *Known issue*) |
+| `close_document` | Close a document; Krita's pending canvas work is drained first (see *Known issue*) |
 | `transform_image` | resize canvas, scale, rotate, crop, flatten; the size-changing ones need a view-less document (see *Known issue*) |
-| `create_layer` / `set_layer` / `delete_layer` | Layer stack management |
+| `create_layer` / `set_layer` / `delete_layer` | Layer stack management, incl. alpha lock, clipping (`clip_to_below`) and colour labels |
 | `duplicate_layer` / `move_layer` / `merge_layer_down` | Restacking and merging |
-| `get_image` | Render the canvas and return a PNG Claude can see |
+| `transform_layer` | Move / scale / rotate one layer's content (undoable) |
+| `get_image` | Render the canvas and return a PNG Claude can see; `grid` overlays labelled coordinates, `zoom` magnifies a region pixel-exactly |
 | `get_pixel` | Exact colour at one pixel |
-| `draw` | Shapes, text, gradients, bitmaps onto a paint layer |
+| `paint_strokes` | Krita's real brush engines along point lists, with pressure; any preset, undoable |
+| `draw` | Exact shapes, text, gradients, bitmaps onto a paint layer |
+| `add_vector_shapes` / `list_vector_shapes` / `remove_vector_shapes` | Editable text (wrapping, box fitting, outlines), speech bubbles with tails, vector shapes |
 | `apply_filter` | Any Krita filter, whole layer or a region |
-| `set_selection` | rect / all / none / invert / grow / shrink / feather |
-| `list_capabilities` | Filter names and parameters, blending mode ids |
-| `trigger_action` | Fire a Krita menu action by id (`edit_undo`, …); script-running actions are refused while `run_python` is off (see *Arbitrary Python is opt-in*) |
+| `set_selection` | rect / ellipse / polygon / magic wand / colour range / layer alpha, combine modes, grow / shrink / feather / border / smooth / fill holes / invert / none |
+| `fill` | Fill or erase the selection (or a region) on a paint layer |
+| `list_capabilities` | Filters and their parameters, blending modes, installed fonts, brush presets |
+| `trigger_action` | Fire a Krita menu action by id (`edit_undo`, …) on the *active* document; script-running actions are refused while `run_python` is off (see *Arbitrary Python is opt-in*) |
 | `run_python` | Arbitrary Python inside Krita, full libkis access — **off by default** |
 | `self_test` | End-to-end health check |
+
+Every tool's arguments are checked against its published schema before
+anything reaches Krita: an unknown field, a wrong type or a value outside an
+enum comes back as `invalid_arguments` naming the field. `null` for an optional
+field means "not given".
 
 ### Arbitrary Python is opt-in
 
@@ -193,6 +202,55 @@ Geometry uses `w`/`h`; outline thickness is `stroke_width`, kept separate so
 the two can't be confused. Only the union of affected pixels is read, painted
 and written back, so a small shape on a huge canvas stays cheap.
 
+### Brushwork, lettering and cleanup
+
+Three write paths, each for what it does best:
+
+| Path | Tool | Undo | Use it for |
+| --- | --- | --- | --- |
+| Krita's brush engines | `paint_strokes` | yes | sketching, inking, painting — any preset, pressure per point |
+| Editable vector shapes | `add_vector_shapes` | yes (Krita's shape tools) | typesetting, speech bubbles, SFX, clean line art |
+| Exact pixels | `draw`, `fill` | no | pixel-exact shapes, pasting bitmaps, flat cleanup fills |
+
+**Brushes.** `paint_strokes` takes `[[x, y], …]` (one smooth stroke through the
+points) or `[[x, y, pressure], …]`. `brush` is a preset name or a unique part of
+it (`list_capabilities` with `kind: brush_presets`); `size`, `color`,
+`opacity` and `erase` apply to this call only and the user's settings are put
+back afterwards. Krita keeps brush settings on its views, so those settings
+need *some* document with a view open — it does not have to be the one being
+painted; without one the call is refused with kind `needs_view`.
+
+**Text and bubbles.** Shapes go onto a vector layer and stay editable with
+Krita's text and shape tools. Coordinates are canvas pixels. A `text` shape
+either sits at an `x, y` baseline (optional `width` wraps it), or fills a
+`box`: it wraps to the box width, shrinks the font until the block fits
+(`fit`, down to `min_size`), and aligns vertically (`valign`). The response
+reports every shape's pixel bounds and the fitted size, so an agent can check
+the layout without guessing. `stroke` outlines the glyphs under the fill — the
+usual SFX look. A `bubble` is one seamless speech-bubble outline with a tail
+pointing at `tail`. A font that is not installed is reported as a warning,
+because Krita would otherwise substitute one silently.
+
+**Cleanup (scanlation).** The usual sequence on a raw page:
+
+```text
+set_selection  mode=contiguous x,y inside the bubble   # magic wand on the white
+set_selection  mode=fill_holes                          # swallow the old lettering
+create_layer   name=clean
+fill           layer=clean color=#ffffff                # paint it out
+set_selection  mode=none
+add_vector_shapes  shapes=[{type: text, box: …, align: center, font: …}]
+```
+
+`mode=color` picks every pixel near a colour (optionally inside `region`),
+`layer_alpha` turns a layer's pixels into a selection (grow it and fill for a
+text backing), and `combine` adds, subtracts or intersects the new pick with
+the current selection.
+
+**Seeing precisely.** `get_image` with `grid: 100` labels canvas coordinates on
+the returned picture; `zoom: 8` on a small `region` returns crisp magnified
+pixels. Neither changes the document.
+
 ### Addressing layers
 
 Layers are reported in docker order, top first. Reference one by name
@@ -228,10 +286,12 @@ against the discovery file, because nothing was sent the first time.
 
 ## Things worth knowing
 
-**Drawing bypasses undo.** `draw` writes pixels directly, which Krita's undo
-history doesn't record. Draw onto a layer you can delete. `apply_filter` on a
-whole layer *is* undoable; on a sub-region it isn't, and the response says
-which you got.
+**Pixel writes bypass undo.** `draw` and `fill` write pixels directly, which
+Krita's undo history doesn't record — work on a layer you can delete.
+`paint_strokes`, `transform_layer` and vector shapes go through Krita and are
+undoable. `apply_filter` on a whole layer *is* undoable; on a sub-region it
+isn't, and the response says which you got. `edit_undo` (via `trigger_action`)
+acts on the active document, so a view-less document has no way to undo.
 
 **Blending modes can't be validated.** Krita 5.3 has no API to enumerate
 composite ops and accepts any string, silently rendering unknown ids as Normal.
@@ -359,7 +419,7 @@ entry with no matching completion names the operation that killed it.
 
 ```bash
 python mcp_server.py --selftest    # quick health check inside Krita
-python test_mcp.py                 # full suite, 77 checks
+python test_mcp.py                 # full suite, 85 checks
 python test_mcp.py -v              # ...printing every tool result
 python example_poster.py           # paint the example poster
 python example_banner.py           # paint this README's banner
@@ -379,6 +439,9 @@ python test_transport.py       # a lost answer is never replayed
 python test_mainthread.py      # a job that missed its deadline is cancelled
 python test_stress_close.py    # trace/crash evidence parsing
 python test_gate.py            # the Python gate policy
+python test_schema.py          # argument validation at the MCP boundary
+python test_raster.py          # magic wand / hole filling on raw pixels
+python test_svgshapes.py       # text, bubble and shape SVG generation
 ```
 
 ### Soak testing
@@ -437,8 +500,12 @@ pykrita/
     extension.py           lifetime, menu actions, settings
     httpserver.py          loopback HTTP, auth, discovery file, tracing
     mainthread.py          worker thread -> GUI thread hand-off
-    ops.py                 the operations
-    imaging.py             QImage <-> Krita pixels, colour parsing
+    ops.py                 the core operations
+    paint_ops.py           brush strokes, layer transforms, selections, fill
+    vector_ops.py          editable text, bubbles and shapes
+    svgshapes.py           shape specs -> SVG (pure, Krita-free)
+    raster.py              magic wand / hole filling on pixel buffers (pure)
+    imaging.py             QImage <-> Krita pixels, colour parsing, grid
 ```
 
 ### Configuration

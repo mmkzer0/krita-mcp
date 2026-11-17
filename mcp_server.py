@@ -24,7 +24,7 @@ import threading
 import time
 
 SERVER_NAME = "krita"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 PREFERRED_PROTOCOL = "2025-06-18"
@@ -302,6 +302,18 @@ LAYER_PROP = {
                     "\"uuid:<id>\", or omit for the active layer."),
 }
 
+LAYER_FLAGS = {
+    "alpha_lock": {"type": "boolean",
+                   "description": "Paint only where the layer already has "
+                                  "pixels."},
+    "clip_to_below": {"type": "boolean",
+                      "description": "Show this layer only where the layers "
+                                     "below it (same group) have pixels -- "
+                                     "a clipping layer."},
+    "color_label": {"type": "integer", "minimum": 0, "maximum": 8,
+                    "description": "Krita's layer colour label; 0 is none."},
+}
+
 REGION_PROP = {
     "type": "object",
     "description": "Pixel rectangle on the canvas.",
@@ -372,6 +384,93 @@ DRAW_COMMAND = {
     "required": ["type"],
 }
 
+_COLOR = {"type": ["string", "array"],
+          "description": "#rrggbb, #rrggbbaa, a colour name, or [r,g,b(,a)]."}
+
+VECTOR_SHAPE = {
+    "type": "object",
+    "description": (
+        "One editable vector shape, in canvas pixels. `type` picks the "
+        "fields:\n"
+        "- text: text, plus EITHER x, y (first baseline; with `align` x is "
+        "the left edge/centre/right edge) and optional width (wrap width) "
+        "OR box {x,y,width,height} to wrap inside, with valign "
+        "(top|middle|bottom, default middle), fit (default true: shrink the "
+        "font until the block fits) and min_size. Styling: font (family or "
+        "comma list), size (px, default 24), color, stroke + stroke_width "
+        "(outline drawn under the fill, for SFX/legibility), bold, italic, "
+        "align (left|center|right), line_height (multiplier), "
+        "letter_spacing (px), rotation (degrees clockwise), vertical "
+        "(top-to-bottom, right-to-left columns). \\n keeps a line break.\n"
+        "- bubble: x, y, width, height (the elliptical body), tail [x,y] "
+        "(tip, outside the body), tail_width, fill (white), stroke (black), "
+        "stroke_width (3): one seamless speech-bubble outline.\n"
+        "- ellipse: cx, cy, rx, ry, rotation; rect: x, y, width, height, "
+        "radius, rotation; polygon: points [[x,y],...]; path: d (SVG path "
+        "data). These take fill (default black), stroke (default none), "
+        "stroke_width.\n"
+        "Every shape takes an optional unique `name`, which is how "
+        "list/remove_vector_shapes refer to it."),
+    "properties": {
+        "type": {"type": "string",
+                 "enum": ["text", "bubble", "ellipse", "rect", "polygon",
+                          "path"]},
+        "name": {"type": "string"},
+        "text": {"type": "string"},
+        "x": {"type": "number"}, "y": {"type": "number"},
+        "width": {"type": "number"}, "height": {"type": "number"},
+        "box": {"type": "object",
+                "properties": {"x": {"type": "number"},
+                               "y": {"type": "number"},
+                               "width": {"type": "number"},
+                               "height": {"type": "number"}},
+                "required": ["x", "y", "width", "height"],
+                "additionalProperties": False},
+        "valign": {"type": "string", "enum": ["top", "middle", "bottom"]},
+        "fit": {"type": "boolean"},
+        "min_size": {"type": "number", "minimum": 1},
+        "align": {"type": "string", "enum": ["left", "center", "right"]},
+        "font": {"type": "string"},
+        "size": {"type": "number", "minimum": 1},
+        "color": _COLOR, "fill": _COLOR, "stroke": _COLOR,
+        "stroke_width": {"type": "number", "minimum": 0},
+        "bold": {"type": "boolean"}, "italic": {"type": "boolean"},
+        "vertical": {"type": "boolean"},
+        "line_height": {"type": "number"},
+        "letter_spacing": {"type": "number"},
+        "rotation": {"type": "number"},
+        "cx": {"type": "number"}, "cy": {"type": "number"},
+        "rx": {"type": "number"}, "ry": {"type": "number"},
+        "radius": {"type": "number", "minimum": 0},
+        "points": {"type": "array", "maxItems": 5000, "items": {
+            "type": "array", "items": {"type": "number"},
+            "minItems": 2, "maxItems": 2}},
+        "d": {"type": "string"},
+        "tail": {"type": "array", "items": {"type": "number"},
+                 "minItems": 2, "maxItems": 2},
+        "tail_width": {"type": "number"},
+    },
+    "required": ["type"],
+    "additionalProperties": False,
+}
+
+STROKE = {
+    "type": "object",
+    "description": ("One brush stroke: points [[x,y],...] or, with pen "
+                    "pressure, [[x,y,p],...] with p in 0..1 for every point. "
+                    "Without pressure the stroke is one smooth curve through "
+                    "the points (smooth=false for straight segments)."),
+    "properties": {
+        "points": {"type": "array", "minItems": 2, "maxItems": 5000,
+                   "items": {"type": "array", "items": {"type": "number"},
+                             "minItems": 2, "maxItems": 3}},
+        "smooth": {"type": "boolean", "default": True},
+    },
+    "required": ["points"],
+    "additionalProperties": False,
+}
+
+
 
 def tool(name, description, properties, required=None, op=None, image=False,
          transform=None, exec_required=False):
@@ -406,14 +505,24 @@ def _transform_image(args):
     return mapping[action], args
 
 
+_CAPABILITY_OPS = {
+    "filters": "list_filters",
+    "blending_modes": "list_blending_modes",
+    "fonts": "list_fonts",
+    "brush_presets": "list_brush_presets",
+}
+
+
 def _list_capabilities(args):
     kind = args.pop("kind", "filters")
-    if kind == "filters":
-        return "list_filters", args
-    if kind == "blending_modes":
-        return "list_blending_modes", args
-    raise BridgeError("invalid_request",
-                      "kind must be 'filters' or 'blending_modes'")
+    if kind not in _CAPABILITY_OPS:
+        raise BridgeError("invalid_request",
+                          "kind must be one of: " + ", ".join(_CAPABILITY_OPS))
+    if kind in ("fonts", "brush_presets"):
+        args.pop("include_parameters", None)
+    else:
+        args.pop("filter", None)
+    return _CAPABILITY_OPS[kind], args
 
 
 TOOLS = [
@@ -478,10 +587,9 @@ TOOLS = [
 
     tool("close_document",
          "Close a document. Refuses to discard unsaved work unless you say "
-         "so. CAUTION: Krita can crash while tearing down a heavily-edited "
-         "document (upstream reports roughly one close in five after a long "
-         "editing session; saving first does not help). Prefer leaving "
-         "documents open and letting the user close them.",
+         "so. The bridge lets Krita finish the document's pending canvas "
+         "work before the teardown (Krita 5.3.4 otherwise crashes in its "
+         "layer docker on some closes; see the README's crash note).",
          {"document": DOCUMENT_PROP,
           "save": {"type": "boolean", "default": False},
           "discard_changes": {"type": "boolean", "default": False}}),
@@ -509,27 +617,32 @@ TOOLS = [
 
     tool("create_layer",
          "Add a layer. New layers go to the top of their parent unless you "
-         "pass `index` (0 is topmost, negative counts from the bottom).",
+         "pass `index` (0 is topmost, negative counts from the bottom). "
+         "Layers nest in group layers; masks (transparencymask, ...) take "
+         "the layer they apply to as `parent`.",
          {"document": DOCUMENT_PROP,
           "name": {"type": "string", "default": "Layer"},
           "type": {"type": "string", "default": "paintlayer",
-                   "enum": ["paintlayer", "grouplayer", "filterlayer",
-                            "filllayer", "filelayer", "clonelayer",
-                            "vectorlayer", "transparencymask", "filtermask",
-                            "transformmask", "selectionmask", "colorizemask"]},
+                   "enum": ["paintlayer", "grouplayer", "filllayer",
+                            "filelayer", "clonelayer", "vectorlayer",
+                            "transparencymask", "selectionmask"]},
           "parent": {"type": "string",
-                     "description": "A group layer to nest inside; omit for "
-                                    "the top level."},
+                     "description": "A group layer to nest inside (omit for "
+                                    "the top level); for a mask, the layer "
+                                    "it applies to."},
           "index": {"type": "integer"},
           "select": {"type": "boolean", "default": True},
           "opacity": {"type": "number"},
           "blending_mode": {"type": "string"},
           "visible": {"type": "boolean"},
-          "locked": {"type": "boolean"}}),
+          "locked": {"type": "boolean"},
+          **LAYER_FLAGS}),
 
     tool("set_layer",
          "Change a layer's properties: rename it, set opacity (0-255, or 0-1), "
-         "blending mode, visibility, lock, and optionally make it active.",
+         "blending mode, visibility, lock, alpha lock, clipping to the layers "
+         "below (shading/colour flats), colour label, and optionally make it "
+         "active.",
          {"document": DOCUMENT_PROP,
           "layer": LAYER_PROP,
           "new_name": {"type": "string"},
@@ -538,6 +651,7 @@ TOOLS = [
                             "description": "See list_capabilities."},
           "visible": {"type": "boolean"},
           "locked": {"type": "boolean"},
+          **LAYER_FLAGS,
           "select": {"type": "boolean", "default": False,
                      "description": "Also make this the active layer."}}),
 
@@ -565,14 +679,24 @@ TOOLS = [
     tool("get_image",
          "Render the canvas and return it as a PNG you can actually look at. "
          "Use this to check your work. Defaults to the merged image; pass "
-         "`layer` for one layer in isolation.",
+         "`layer` for one layer in isolation. For pixel-precise work, `grid` "
+         "overlays labelled canvas coordinates and `zoom` magnifies a small "
+         "region with crisp pixels; both only change the returned picture.",
          {"document": DOCUMENT_PROP,
           "layer": {"type": "string",
                     "description": "Omit or \"merged\" for the composite."},
           "region": REGION_PROP,
           "max_size": {"type": "integer", "default": 1024,
                        "description": "Longest edge of the returned image; "
-                                      "the canvas is never upscaled."}},
+                                      "the canvas is never upscaled unless "
+                                      "`zoom` is set."},
+          "grid": {"type": "integer", "minimum": 4,
+                   "description": "Grid spacing in canvas pixels; lines are "
+                                  "labelled with their canvas coordinate."},
+          "zoom": {"type": "integer", "minimum": 1, "maximum": 16,
+                   "description": "Nearest-neighbour magnification of the "
+                                  "region (overrides max_size); the result "
+                                  "may be at most 4096 px on a side."}},
          image=True),
 
     tool("get_pixel", "Read the exact colour at one pixel.",
@@ -582,9 +706,11 @@ TOOLS = [
 
     tool("draw",
          "Paint shapes, text, gradients and bitmaps onto an RGBA/8-bit paint "
-         "layer. Commands are drawn in order, so later ones sit on top. "
-         "Note: this writes pixels directly and does not enter Krita's undo "
-         "history, so draw onto a layer you can delete.",
+         "layer, as exact pixels. Commands are drawn in order, so later ones "
+         "sit on top. Note: this writes pixels directly and does not enter "
+         "Krita's undo history, so draw onto a layer you can delete. For "
+         "brushwork use paint_strokes; for editable text and speech bubbles "
+         "use add_vector_shapes.",
          {"document": DOCUMENT_PROP,
           "layer": LAYER_PROP,
           "antialias": {"type": "boolean", "default": True},
@@ -605,32 +731,155 @@ TOOLS = [
          required=["filter"]),
 
     tool("set_selection",
-         "Change the active selection, which constrains filters and painting.",
+         "Change the active selection, which constrains filters, fill and "
+         "Krita's own painting. Shape modes: rect, ellipse (x, y, width, "
+         "height), polygon (points). Pixel modes: contiguous (magic wand from "
+         "seed x, y with tolerance), color (every pixel near `color`), "
+         "layer_alpha (a layer's opaque pixels, e.g. text to outline); they "
+         "sample the merged image or `sample` layer, optionally only inside "
+         "`region`. `combine` merges the new shape into the existing "
+         "selection. Modifiers act on the current selection: invert, grow, "
+         "shrink, feather, border (amount px), smooth, fill_holes (take in "
+         "everything the selection encloses -- after a magic-wand pick of a "
+         "bubble interior this swallows the old lettering); none clears it.",
          {"document": DOCUMENT_PROP,
           "mode": {"type": "string", "default": "rect",
-                   "enum": ["rect", "all", "none", "invert", "grow", "shrink",
-                            "feather"]},
+                   "enum": ["rect", "ellipse", "polygon", "contiguous",
+                            "color", "layer_alpha", "all", "none", "invert",
+                            "grow", "shrink", "feather", "border", "smooth",
+                            "fill_holes"]},
+          "combine": {"type": "string", "default": "replace",
+                      "enum": ["replace", "add", "subtract", "intersect"]},
           "x": {"type": "integer"}, "y": {"type": "integer"},
           "width": {"type": "integer"}, "height": {"type": "integer"},
+          "points": {"type": "array", "minItems": 3, "maxItems": 5000, "items": {
+              "type": "array", "items": {"type": "number"},
+              "minItems": 2, "maxItems": 2}},
           "value": {"type": "integer", "default": 255,
-                    "description": "Selection strength 0-255."},
+                    "description": "Selection strength 0-255 (rect)."},
           "add": {"type": "boolean", "default": False,
-                  "description": "Union with the existing selection."},
+                  "description": "Same as combine=add."},
+          "tolerance": {"type": "integer", "minimum": 0, "maximum": 255,
+                        "default": 32,
+                        "description": "Per-channel difference that still "
+                                       "matches (contiguous, color)."},
+          "connectivity": {"type": "integer", "enum": [4, 8], "default": 4},
+          "color": _COLOR,
+          "sample": {"type": "string",
+                     "description": "Layer to sample; omit for the merged "
+                                    "image."},
+          "layer": {"type": "string",
+                    "description": "The layer whose alpha layer_alpha "
+                                   "reads."},
+          "threshold": {"type": "integer", "minimum": 0, "maximum": 255,
+                        "default": 0,
+                        "description": "layer_alpha: 0 keeps soft edges; "
+                                       "otherwise alpha >= threshold is "
+                                       "fully selected."},
+          "region": REGION_PROP,
           "amount": {"type": "integer", "default": 1,
-                     "description": "Pixels, for grow/shrink/feather."}}),
+                     "description": "Pixels, for grow/shrink/feather/"
+                                    "border."}}),
+
+    tool("fill",
+         "Fill the selection (or a region, or their overlap) on a paint "
+         "layer with a colour, or erase it to transparency. Soft selection "
+         "edges blend. The cleanup step for scanlation: select the bubble "
+         "interior or the old lettering, then fill it white. Writes pixels "
+         "directly, outside Krita's undo history.",
+         {"document": DOCUMENT_PROP, "layer": LAYER_PROP,
+          "color": _COLOR,
+          "erase": {"type": "boolean", "default": False},
+          "opacity": {"type": "number", "minimum": 0, "maximum": 1,
+                      "default": 1},
+          "region": REGION_PROP,
+          "use_selection": {"type": "boolean", "default": True}}),
+
+    tool("paint_strokes",
+         "Paint with Krita's real brush engines (any preset, pressure, "
+         "undoable) along point lists -- the tool for drawing and inking. "
+         "brush/size/color/opacity/erase are applied for this call only and "
+         "the user's settings are restored afterwards; they need some "
+         "document to have a view open.",
+         {"document": DOCUMENT_PROP, "layer": LAYER_PROP,
+          "strokes": {"type": "array", "items": STROKE, "minItems": 1,
+                      "maxItems": 200},
+          "brush": {"type": "string",
+                    "description": "Brush preset name or a unique part of "
+                                   "it; see list_capabilities "
+                                   "kind=brush_presets."},
+          "size": {"type": "number", "minimum": 0.5, "maximum": 1000},
+          "color": _COLOR,
+          "opacity": {"type": "number", "minimum": 0, "maximum": 1},
+          "erase": {"type": "boolean"}},
+         required=["strokes"]),
+
+    tool("transform_layer",
+         "Move, scale or rotate one layer's content (Krita's own undoable "
+         "transforms). Applied in the order scale, rotate (both about the "
+         "content's centre), translate.",
+         {"document": DOCUMENT_PROP, "layer": LAYER_PROP,
+          "translate": {"type": "array", "items": {"type": "number"},
+                        "minItems": 2, "maxItems": 2,
+                        "description": "[dx, dy] in pixels."},
+          "scale": {"type": ["number", "array"],
+                    "description": "Factor, or [sx, sy]."},
+          "rotate": {"type": "number",
+                     "description": "Degrees, clockwise."},
+          "strategy": {"type": "string", "default": "Bicubic",
+                       "enum": ["Bicubic", "Bilinear", "NearestNeighbor",
+                                "Lanczos3", "Box"]}}),
+
+    tool("add_vector_shapes",
+         "Add editable vector shapes and text -- typesetting, speech "
+         "bubbles, SFX lettering, clean line art -- to a vector layer (a new "
+         "one unless `layer` names an existing vector layer). Everything "
+         "stays editable with Krita's text and shape tools. Returns each "
+         "shape's name and its bounds in canvas pixels; text placed in a "
+         "`box` reports the font size it was fitted at.",
+         {"document": DOCUMENT_PROP,
+          "layer": {"type": "string",
+                    "description": "An existing vector layer; omit to "
+                                   "create one."},
+          "new_layer_name": {"type": "string", "default": "Vector"},
+          "shapes": {"type": "array", "items": VECTOR_SHAPE, "minItems": 1,
+                     "maxItems": 500}},
+         required=["shapes"]),
+
+    tool("list_vector_shapes",
+         "List the shapes on a vector layer with their names, types and "
+         "bounds in canvas pixels (optionally their SVG).",
+         {"document": DOCUMENT_PROP,
+          "layer": {"type": "string"},
+          "include_svg": {"type": "boolean", "default": False}},
+         required=["layer"]),
+
+    tool("remove_vector_shapes",
+         "Remove shapes from a vector layer by name. All names must exist; "
+         "otherwise nothing is removed.",
+         {"document": DOCUMENT_PROP,
+          "layer": {"type": "string"},
+          "names": {"type": "array", "items": {"type": "string"},
+                    "minItems": 1}},
+         required=["layer", "names"]),
 
     tool("list_capabilities",
          "List what this Krita build supports: filter names (with their "
-         "parameters) or blending mode names.",
+         "parameters), blending modes, installed fonts or brush presets.",
          {"kind": {"type": "string", "default": "filters",
-                   "enum": ["filters", "blending_modes"]},
-          "include_parameters": {"type": "boolean", "default": False}},
+                   "enum": ["filters", "blending_modes", "fonts",
+                            "brush_presets"]},
+          "include_parameters": {"type": "boolean", "default": False},
+          "filter": {"type": "string",
+                     "description": "fonts/brush_presets: case-insensitive "
+                                    "substring to match."}},
          transform=_list_capabilities),
 
     tool("trigger_action",
          "Fire a Krita menu action by its internal id -- the escape hatch for "
-         "anything with no dedicated tool. Useful ids: edit_undo, edit_redo, "
-         "deselect, select_all, invert_selection.",
+         "anything with no dedicated tool. Actions act on the ACTIVE "
+         "document and view, not on a `document` you name. Useful ids: "
+         "edit_undo, edit_redo, select_all, invert_selection.",
          {"name": {"type": "string"}},
          required=["name"]),
 

@@ -137,6 +137,64 @@ def scale_to_fit(img, max_size):
     return scaled, factor
 
 
+MAX_GRID_LINES = 400
+
+
+def draw_grid(img, origin_x, origin_y, factor, spacing):
+    """Overlay canvas-coordinate grid lines and labels onto a returned image.
+
+    ``img`` shows the canvas rect starting at (origin_x, origin_y), scaled by
+    ``factor``. Lines fall on canvas multiples of ``spacing`` and are labelled
+    with their canvas coordinate, so a vision model can read positions off
+    the picture. Only the returned copy is drawn on, never the document.
+    """
+    from .compat import QFont, QPainter, QPen, QPointF
+
+    width = img.width() / factor
+    height = img.height() / factor
+    first_x = -(-origin_x // spacing) * spacing
+    first_y = -(-origin_y // spacing) * spacing
+    xs = list(range(first_x, int(origin_x + width) + 1, spacing))
+    ys = list(range(first_y, int(origin_y + height) + 1, spacing))
+    if len(xs) + len(ys) > MAX_GRID_LINES:
+        raise ImagingError(
+            "grid {0} would draw {1} lines over this region; use a larger "
+            "spacing or a smaller region".format(spacing, len(xs) + len(ys)))
+    img = img.convertToFormat(QImage.Format_ARGB32)
+    painter = QPainter()
+    if not painter.begin(img):
+        raise ImagingError("could not draw the grid")
+    try:
+        font = QFont()
+        font.setPixelSize(10)
+        painter.setFont(font)
+        line = QPen(QColor(255, 0, 255, 150))
+        line.setWidth(1)
+        for cx in xs:
+            px = (cx - origin_x) * factor
+            painter.setPen(line)
+            painter.drawLine(QPointF(px, 0), QPointF(px, img.height()))
+            _grid_label(painter, QPointF(px + 2, 11), str(cx))
+        for cy in ys:
+            py = (cy - origin_y) * factor
+            painter.setPen(line)
+            painter.drawLine(QPointF(0, py), QPointF(img.width(), py))
+            _grid_label(painter, QPointF(2, py - 2 if py > 12 else py + 11),
+                        str(cy))
+    finally:
+        painter.end()
+    return img
+
+
+def _grid_label(painter, at, text):
+    from .compat import QPen, QPointF
+    painter.setPen(QPen(QColor(255, 255, 255, 220)))
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        painter.drawText(QPointF(at.x() + dx, at.y() + dy), text)
+    painter.setPen(QPen(QColor(160, 0, 160)))
+    painter.drawText(at, text)
+
+
 def parse_color(value, default=None):
     """Accept #rgb, #rrggbb, #rrggbbaa, SVG names, or [r,g,b(,a)]."""
     if value is None:
