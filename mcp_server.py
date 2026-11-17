@@ -863,6 +863,45 @@ TOOLS = [
                     "minItems": 1}},
          required=["layer", "names"]),
 
+    tool("checkpoint",
+         "Snapshot a document's layers in memory so `restore` can undo work "
+         "Krita's undo does not cover: draw, fill, sub-region filters, and "
+         "anything on a view-less document. Saves layer properties (visible, "
+         "locked, opacity, blending mode, clip to below, alpha lock) and the "
+         "pixels of RGBA/8-bit paint layers; vector layers, groups and masks "
+         "keep properties only (listed in `skipped`). Not saved: layer names, "
+         "order, selection, canvas size. Memory only, gone when the document "
+         "closes; KRITA_MCP_CHECKPOINT_MB (default 1024) caps all checkpoints "
+         "together, oldest evicted first (reported in `evicted`), at most 20 "
+         "per document.",
+         {"document": DOCUMENT_PROP,
+          "layers": {"type": "array", "items": {"type": "string"},
+                     "minItems": 1,
+                     "description": "Layers to save (a group takes its "
+                                    "children). Omit for every layer."},
+          "label": {"type": "string",
+                    "description": "Up to 80 characters."}}),
+
+    tool("restore",
+         "Put a checkpoint's pixels and layer properties back. The checkpoint "
+         "stays, so restoring again works. Writes outside Krita's undo "
+         "history. Layers deleted since come back as `missing` (not "
+         "recreated); layers added since are left alone (`added_since`).",
+         {"document": DOCUMENT_PROP,
+          "checkpoint": {"type": "string",
+                         "description": "An id from checkpoint, e.g. cp3."}},
+         required=["checkpoint"]),
+
+    tool("list_checkpoints",
+         "List a document's checkpoints and the shared memory budget.",
+         {"document": DOCUMENT_PROP}),
+
+    tool("drop_checkpoints",
+         "Free checkpoint memory: the given ids, or all of the document's.",
+         {"document": DOCUMENT_PROP,
+          "checkpoints": {"type": "array", "items": {"type": "string"},
+                          "minItems": 1}}),
+
     tool("list_capabilities",
          "List what this Krita build supports: filter names (with their "
          "parameters), blending modes, installed fonts or brush presets.",

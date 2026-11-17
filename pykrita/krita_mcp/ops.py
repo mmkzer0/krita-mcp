@@ -1058,6 +1058,7 @@ def op_close_document(params):
     _trace("close: close call returned")
     _settle_after_close()
     _forget_viewless(doc)
+    history_ops.forget_closed_documents()
     _trace("close: settled")
     return {"closed": True, "document": summary}
 
@@ -2282,7 +2283,8 @@ def op_timeout(name, default=30.0):
 
 # Registered last, so a reload of this module re-registers them into the
 # fresh OPS together with everything above.
-from . import paint_ops, vector_ops  # noqa: E402
+from . import history_ops, paint_ops, vector_ops  # noqa: E402
 
 paint_ops.register(op)
 vector_ops.register(op)
+history_ops.register(op)

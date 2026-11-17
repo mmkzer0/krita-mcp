@@ -137,6 +137,7 @@ Restart the client. Krita must be running for the tools to do anything.
 | `apply_filter` | Any Krita filter, whole layer or a region |
 | `set_selection` | rect / ellipse / polygon / magic wand / colour range / layer alpha, combine modes, grow / shrink / feather / border / smooth / fill holes / invert / none |
 | `fill` | Fill or erase the selection (or a region) on a paint layer |
+| `checkpoint` / `restore` / `list_checkpoints` / `drop_checkpoints` | In-memory snapshot of a document's layer pixels and properties; `restore` puts them back, also on view-less documents |
 | `list_capabilities` | Filters and their parameters, blending modes, installed fonts, brush presets |
 | `trigger_action` | Fire a Krita menu action by id (`edit_undo`, …) on the *active* document; script-running actions are refused while `run_python` is off (see *Arbitrary Python is opt-in*) |
 | `run_python` | Arbitrary Python inside Krita, full libkis access — **off by default** |
@@ -287,11 +288,14 @@ against the discovery file, because nothing was sent the first time.
 ## Things worth knowing
 
 **Pixel writes bypass undo.** `draw` and `fill` write pixels directly, which
-Krita's undo history doesn't record — work on a layer you can delete.
-`paint_strokes`, `transform_layer` and vector shapes go through Krita and are
-undoable. `apply_filter` on a whole layer *is* undoable; on a sub-region it
-isn't, and the response says which you got. `edit_undo` (via `trigger_action`)
-acts on the active document, so a view-less document has no way to undo.
+Krita's undo history doesn't record. `paint_strokes`, `transform_layer` and
+vector shapes go through Krita and are undoable. `apply_filter` on a whole
+layer *is* undoable; on a sub-region it isn't, and the response says which you
+got. `edit_undo` (via `trigger_action`) acts on the active document, so a
+view-less document has no way to undo. Take a `checkpoint` before destructive
+work and `restore` it if the result is wrong: it brings back the pixels of
+RGBA/8-bit paint layers and every layer's properties, but not vector shapes,
+deleted layers or the layer order.
 
 **Blending modes can't be validated.** Krita 5.3 has no API to enumerate
 composite ops and accepts any string, silently rendering unknown ids as Normal.
@@ -440,6 +444,7 @@ python test_mainthread.py      # a job that missed its deadline is cancelled
 python test_stress_close.py    # trace/crash evidence parsing
 python test_gate.py            # the Python gate policy
 python test_schema.py          # argument validation at the MCP boundary
+python test_history.py         # checkpoint store: ids, budget, eviction
 python test_raster.py          # magic wand / hole filling on raw pixels
 python test_svgshapes.py       # text, bubble and shape SVG generation
 ```
@@ -504,6 +509,7 @@ pykrita/
     paint_ops.py           brush strokes, layer transforms, selections, fill
     vector_ops.py          editable text, bubbles and shapes
     svgshapes.py           shape specs -> SVG (pure, Krita-free)
+    history_ops.py         checkpoint / restore of layer pixels and properties
     raster.py              magic wand / hole filling on pixel buffers (pure)
     imaging.py             QImage <-> Krita pixels, colour parsing, grid
 ```
@@ -524,6 +530,7 @@ Environment variables, read by both halves:
 | `KRITA_MCP_STATE_DIR` | Override where the discovery file lives |
 | `KRITA_MCP_TRACE` | Set to `1` before starting Krita to log every operation |
 | `KRITA_MCP_PORT` / `KRITA_MCP_TOKEN` | Skip discovery and connect directly |
+| `KRITA_MCP_CHECKPOINT_MB` | Plugin only: memory budget for all checkpoints together (default `1024`) |
 
 ## Platform support
 
