@@ -133,7 +133,7 @@ Restart the client. Krita must be running for the tools to do anything.
 | `get_pixel` | Exact colour at one pixel |
 | `paint_strokes` | Krita's real brush engines along point lists, with pressure; any preset, undoable |
 | `draw` | Exact shapes, text, gradients, bitmaps onto a paint layer |
-| `add_vector_shapes` / `list_vector_shapes` / `remove_vector_shapes` | Editable text (wrapping, box fitting, outlines), speech bubbles with tails, vector shapes |
+| `add_vector_shapes` / `list_vector_shapes` / `update_vector_shapes` / `remove_vector_shapes` | Editable text (wrapping, box fitting, outlines), speech bubbles with tails, vector shapes; retype or move them in place |
 | `apply_filter` | Any Krita filter, whole layer or a region |
 | `set_selection` | rect / ellipse / polygon / magic wand / colour range / layer alpha, combine modes, grow / shrink / feather / border / smooth / fill holes / invert / none |
 | `fill` | Fill or erase the selection (or a region) on a paint layer |
@@ -449,6 +449,7 @@ python test_history.py         # checkpoint store: ids, budget, eviction
 python test_style.py           # layer style ASL builder and parser
 python test_raster.py          # magic wand / hole filling on raw pixels
 python test_svgshapes.py       # text, bubble and shape SVG generation
+python test_vector_update.py   # vector update planning, layer SVG editing
 ```
 
 ### Soak testing
@@ -510,7 +511,7 @@ pykrita/
     ops.py                 the core operations
     paint_ops.py           brush strokes, layer transforms, selections, fill
     vector_ops.py          editable text, bubbles and shapes
-    svgshapes.py           shape specs -> SVG (pure, Krita-free)
+    svgshapes.py           shape specs -> SVG, layer SVG editing (pure, Krita-free)
     history_ops.py         checkpoint / restore of layer pixels and properties
     style_ops.py           layer styles (stroke, drop shadow) as Krita ASL
     raster.py              magic wand / hole filling on pixel buffers (pure)

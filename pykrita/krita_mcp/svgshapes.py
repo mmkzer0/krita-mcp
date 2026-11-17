@@ -4,6 +4,7 @@ Coordinates are rounded to at most three decimals when serialized. Shape names
 are ASCII ids, with unsupported characters replaced by underscores.
 """
 
+import copy
 import math
 import re
 import xml.etree.ElementTree as ET
@@ -259,3 +260,207 @@ def build_svg(shapes, width, height, id_prefix="mcp"):
         except ShapeSpecError as exc:
             raise ShapeSpecError("shape {0}: {1}".format(i, exc)) from None
     return ET.tostring(root, encoding="unicode"), names
+
+
+# --------------------------------------------------------------------------
+# layer-level SVG (VectorLayer.toSvg()) editing
+# --------------------------------------------------------------------------
+#
+# A layer SVG is the document Krita hands back from VectorLayer.toSvg(); its
+# top-level elements are the shapes, in stacking order (first = bottom). These
+# helpers edit that string without Krita, so a layer can be rebuilt without
+# libkis Shape.remove() (F31).
+
+LAYER_SVG_NAMESPACES = (
+    ("", "http://www.w3.org/2000/svg"),
+    ("xlink", "http://www.w3.org/1999/xlink"),
+    ("krita", "http://krita.org/namespaces/svg/krita"),
+    ("sodipodi", "http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"),
+)
+for _prefix, _uri in LAYER_SVG_NAMESPACES:
+    ET.register_namespace(_prefix, _uri)
+
+_NON_SHAPE_TAGS = frozenset(
+    ("defs", "title", "desc", "metadata", "style", "script"))
+
+
+class LayerSvgError(ValueError):
+    """A layer SVG cannot be read or edited as requested."""
+
+
+def _local_name(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def parse_layer_svg(svg):
+    """Parse a ``VectorLayer.toSvg()`` string and return its <svg> root."""
+    if not isinstance(svg, str) or not svg.strip():
+        raise LayerSvgError("layer SVG: expected a non-empty string")
+    try:
+        root = ET.fromstring(svg)
+    except ET.ParseError as exc:
+        raise LayerSvgError("layer SVG: does not parse ({0})".format(exc)) \
+            from None
+    if _local_name(root.tag) != "svg":
+        raise LayerSvgError("layer SVG: root must be <svg>, got <{0}>".format(
+            _local_name(root.tag)))
+    return root
+
+
+def serialize_layer_svg(root):
+    """Serialize an edited layer SVG root (prefixes preserved)."""
+    return ET.tostring(root, encoding="unicode")
+
+
+def empty_root_like(svg):
+    """The <svg> root of ``svg`` with every shape removed (defs kept).
+
+    An empty vector layer exports "" from toSvg(); a layer SVG from the same
+    document (a scratch layer's) supplies the root size and viewBox.
+    """
+    root = parse_layer_svg(svg)
+    for element in layer_shape_elements(root):
+        root.remove(element)
+    return root
+
+
+def is_layer_shape(element):
+    """True for a top-level element that is a shape, not <defs> and friends."""
+    return _local_name(element.tag) not in _NON_SHAPE_TAGS
+
+
+def layer_shape_elements(root):
+    """Top-level shape elements in stacking order (first = bottom)."""
+    return [element for element in root if is_layer_shape(element)]
+
+
+def layer_shape_ids(svg):
+    return [element.get("id") for element in
+            layer_shape_elements(parse_layer_svg(svg))]
+
+
+def layer_shape_count(svg):
+    return len(layer_shape_elements(parse_layer_svg(svg)))
+
+
+def _root_shape(root, shape_id):
+    matches = [element for element in layer_shape_elements(root)
+               if element.get("id") == shape_id]
+    if not matches:
+        raise LayerSvgError(
+            "layer SVG: no top-level shape with id {0!r}".format(shape_id))
+    if len(matches) > 1:
+        raise LayerSvgError(
+            "layer SVG: id {0!r} appears {1} times at the top level; expected "
+            "one shape".format(shape_id, len(matches)))
+    return matches[0]
+
+
+def _copy_shape(element):
+    if not isinstance(element, ET.Element) or not is_layer_shape(element):
+        raise LayerSvgError(
+            "layer SVG: replacement must be a top-level shape element")
+    if not element.get("id"):
+        raise LayerSvgError("layer SVG: replacement shape needs an id")
+    return copy.deepcopy(element)
+
+
+def layer_shape_element(svg, shape_id):
+    """Return a copy of the top-level shape element with ``shape_id``."""
+    return root_shape_element(parse_layer_svg(svg), shape_id)
+
+
+def root_shape_element(root, shape_id):
+    """Return a copy of a top-level shape element from a parsed root."""
+    return copy.deepcopy(_root_shape(root, shape_id))
+
+
+def drop_root_shapes(root, ids):
+    """Remove every top-level shape whose id is in ``ids``; return ids."""
+    wanted = list(dict.fromkeys(ids))
+    wanted_set = set(wanted)
+    matches = {}
+    for element in list(root):
+        if is_layer_shape(element) and element.get("id") in wanted_set:
+            matches.setdefault(element.get("id"), []).append(element)
+    missing = [shape_id for shape_id in wanted if shape_id not in matches]
+    if missing:
+        raise LayerSvgError(
+            "layer SVG: no top-level shape with id {0}".format(
+                ", ".join(repr(shape_id) for shape_id in missing)))
+    removed = []
+    for shape_id in wanted:
+        for element in matches[shape_id]:
+            root.remove(element)
+            removed.append(shape_id)
+    return removed
+
+
+def drop_layer_shapes(svg, ids):
+    """Return (edited SVG, removed ids), dropping top-level shapes by id."""
+    root = parse_layer_svg(svg)
+    removed = drop_root_shapes(root, ids)
+    return serialize_layer_svg(root), removed
+
+
+def drop_root_shapes_at(root, indexes):
+    """Remove top-level shapes by their position; return how many were dropped.
+
+    Krita's shape names are not always unique (two shapes can both be named
+    "dup"), while its SVG export uniquifies the ids ("dup", "dup1"). Position
+    is the only lossless key in that state; the position matches
+    ``VectorLayer.shapes()`` order.
+    """
+    shapes = layer_shape_elements(root)
+    for index in indexes:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise LayerSvgError(
+                "layer SVG: shape index must be an integer, got {0!r}".format(
+                    index))
+    wanted = sorted(set(indexes))
+    for index in wanted:
+        if index < 0 or index >= len(shapes):
+            raise LayerSvgError(
+                "layer SVG: shape index {0} is out of range (0..{1})".format(
+                    index, len(shapes) - 1))
+    for index in reversed(wanted):
+        root.remove(shapes[index])
+    return len(wanted)
+
+
+def drop_layer_shapes_at(svg, indexes):
+    """Return (edited SVG, dropped count), dropping top-level shapes by index."""
+    root = parse_layer_svg(svg)
+    dropped = drop_root_shapes_at(root, indexes)
+    return serialize_layer_svg(root), dropped
+
+
+def replace_root_shape(root, shape_id, elements):
+    """Replace one top-level shape with ``elements`` at its position."""
+    old = _root_shape(root, shape_id)
+    replacements = [_copy_shape(element) for element in elements]
+    index = list(root).index(old)
+    root.remove(old)
+    for offset, element in enumerate(replacements):
+        root.insert(index + offset, element)
+    return old
+
+
+def replace_layer_shape(svg, shape_id, elements):
+    """Return the SVG with one top-level shape replaced in place."""
+    root = parse_layer_svg(svg)
+    replace_root_shape(root, shape_id, elements)
+    return serialize_layer_svg(root)
+
+
+def append_root_shapes(root, elements):
+    """Append shapes after the last top-level element (top of the stack)."""
+    copies = [_copy_shape(element) for element in elements]
+    root.extend(copies)
+
+
+def append_layer_shapes(svg, elements):
+    """Return the SVG with ``elements`` appended at the top of the stack."""
+    root = parse_layer_svg(svg)
+    append_root_shapes(root, elements)
+    return serialize_layer_svg(root)

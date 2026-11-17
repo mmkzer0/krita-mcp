@@ -454,6 +454,27 @@ VECTOR_SHAPE = {
     "additionalProperties": False,
 }
 
+VECTOR_UPDATE = {
+    "type": "object",
+    "description": ("One in-place change to an existing shape: `shape` "
+                    "replaces it with a new spec (the same fields as "
+                    "add_vector_shapes; name and stacking position are kept; "
+                    "shape.name, if given, must equal `name`), or "
+                    "`translate` moves it by [dx, dy] canvas pixels. Give "
+                    "exactly one."),
+    "properties": {
+        "name": {"type": "string",
+                 "description": "Existing shape name from "
+                                "list_vector_shapes."},
+        "shape": VECTOR_SHAPE,
+        "translate": {"type": "array", "items": {"type": "number"},
+                      "minItems": 2, "maxItems": 2,
+                      "description": "[dx, dy] in canvas pixels."},
+    },
+    "required": ["name"],
+    "additionalProperties": False,
+}
+
 STROKE = {
     "type": "object",
     "description": ("One brush stroke: points [[x,y],...] or, with pen "
@@ -905,12 +926,30 @@ TOOLS = [
 
     tool("remove_vector_shapes",
          "Remove shapes from a vector layer by name. All names must exist; "
-         "otherwise nothing is removed.",
+         "otherwise nothing is removed. The layer is rebuilt from its SVG "
+         "(Krita's per-shape removal is unsafe from scripts), which keeps "
+         "its name, position, properties and layer style but changes its "
+         "uuid.",
          {"document": DOCUMENT_PROP,
           "layer": {"type": "string"},
           "names": {"type": "array", "items": {"type": "string"},
                     "minItems": 1}},
          required=["layer", "names"]),
+
+    tool("update_vector_shapes",
+         "Change existing vector shapes in place -- retype a balloon, refit "
+         "text to its box, nudge a bubble -- keeping names and stacking "
+         "order. Each update replaces a shape's whole spec or translates it "
+         "by [dx, dy] canvas pixels. Everything is checked first, so a "
+         "refusal changes nothing. Box-fitted text reports fitted_size. A "
+         "replacement rebuilds the layer like remove_vector_shapes "
+         "(layer_rebuilt=true, new uuid); a translate does not.",
+         {"document": DOCUMENT_PROP,
+          "layer": {"type": "string",
+                    "description": "The vector layer holding the shapes."},
+          "updates": {"type": "array", "items": VECTOR_UPDATE,
+                      "minItems": 1, "maxItems": 200}},
+         required=["layer", "updates"]),
 
     tool("checkpoint",
          "Snapshot a document's layers in memory so `restore` can undo work "

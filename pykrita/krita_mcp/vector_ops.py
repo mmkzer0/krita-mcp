@@ -1,23 +1,38 @@
 """Editable vector shapes and text on vector layers.
 
 Shapes arrive as pixel-coordinate specs, are turned into SVG by
-``svgshapes.build_svg`` and handed to ``VectorLayer.addShapesFromSvg``, so
+``svgshapes.build_svg`` and inserted with ``VectorLayer.addShapesFromSvg``, so
 everything stays editable with Krita's own text and shape tools afterwards.
 
 Units: Krita keeps vector shapes in points (1/72 inch). An SVG whose root is
-``width="{W}px" viewBox="0 0 {W} {H}"`` maps user units 1:1 to document pixels
-(measured on 5.3.4: a 100-unit rect at 300 dpi comes back as 24 pt), and
+``width="{W}pt" viewBox="0 0 W H"`` maps user units 1:1 to document points
+(measured on 5.3.4: a 1200 px document at 300 dpi is 288 pt), and
 ``boundingBox()`` is converted back with the document's resolution, so every
 coordinate this module reports is in canvas pixels.
+
+Layer edits never call ``Shape.remove()``. libkis resolves it through
+``Krita.activeDocument()`` instead of the shape's own document, so it crashes
+when no document is active (only view-less documents open) and otherwise
+removes through the active document's view and undo (F31). Instead a layer edit
+copies the layer's own ``toSvg()``, drops/replaces/splices elements in that
+string (document order is stacking order) and replays it into a fresh vector
+layer with ``_rebuild_layer``. A rebuild gives the layer a new uuid, which the
+results report as ``layer_rebuilt``. Box-fit trials run on a scratch vector
+layer that is discarded with ``Node.remove()``; ``Node.remove()`` does not have
+the F31 problem.
 """
+
+import math
 
 from . import svgshapes
 from .compat import QPointF
 
 MAX_FIT_STEPS = 8
+MAX_UPDATES = 200
 _ALIGN_OFFSET = {"left": 0.0, "center": 0.5, "right": 1.0}
 _VALIGN = ("top", "middle", "bottom")
 _BOX_KEYS = ("box", "valign", "fit", "min_size")
+_UPDATE_KEYS = ("name", "shape", "translate")
 _GENERIC_FONTS = {"serif", "sans-serif", "monospace", "cursive", "fantasy",
                   "system-ui"}
 
@@ -61,6 +76,21 @@ def _new_vector_layer(doc, name):
     return layer
 
 
+def _new_scratch_layer(doc):
+    """A throwaway vector layer for box-fit trials; deleted by the caller."""
+    return _new_vector_layer(doc, "mcp-scratch")
+
+
+def _remove_layer(layer, purpose):
+    """Node.remove() a layer we created; never used on a user's layer."""
+    name = layer.name()
+    try:
+        layer.remove()
+    except Exception as exc:  # keep the operation's own error visible
+        _o()._log("could not remove {0} layer {1!r}: {2}".format(
+            purpose, name, exc))
+
+
 def _shape_entry(shape, units):
     return {"name": shape.name(), "type": shape.type(),
             "bounds": units.rect(shape.boundingBox()),
@@ -99,10 +129,8 @@ def _add(doc, layer, specs, prefix):
         raise _err(str(exc))
     shapes = list(layer.addShapesFromSvg(svg))
     if len(shapes) != len(names):
-        for shape in shapes:
-            shape.remove()
-        raise _err("Krita created {0} shapes from {1} specs; nothing was "
-                   "kept.".format(len(shapes), len(names)))
+        raise _err("Krita created {0} shapes from {1} specs; the call was "
+                   "rolled back.".format(len(shapes), len(names)))
     return shapes, names
 
 
@@ -114,13 +142,13 @@ def _unique_prefix(layer):
     return "shape{0}".format(k)
 
 
-def _split_box(spec, index):
+def _split_box(spec, index, key=None):
     """Separate the layout keys this module owns from the builder's spec."""
     o = _o()
     layout = {k: spec[k] for k in _BOX_KEYS if k in spec}
     if not layout:
         return spec, None
-    key = "shapes[{0}]".format(index)
+    key = key or "shapes[{0}]".format(index)
     if spec.get("type") != "text":
         raise _err("{0}: box, valign, fit and min_size apply to text only"
                    .format(key))
@@ -162,8 +190,19 @@ def _fits(bounds, box):
             bounds["height"] <= box[3] + 0.5)
 
 
-def _place_in_box(doc, layer, spec, layout, name, units):
-    """Add one text shape laid out in its box; returns (shape, size, warning).
+def _trial_name(prefix, number, reserved):
+    name = "{0}-{1}".format(prefix, number)
+    while name in reserved:
+        name = "_" + name
+    return name
+
+
+def _place_in_box(doc, layer, spec, layout, name, units, prefix, reserved):
+    """Lay one text shape out on ``layer``; returns (shape, size, warning).
+
+    Trials stay on ``layer`` (a scratch layer) instead of being removed:
+    Shape.remove() is unusable (F31). The final shape carries ``name`` and is
+    the one the caller extracts from the scratch layer's SVG.
 
     Wrapping comes from Krita's own layout (``inline-size`` = box width), so
     the only way to know the height is to lay the text out and measure it:
@@ -175,21 +214,25 @@ def _place_in_box(doc, layer, spec, layout, name, units):
     align = spec.get("align", "left")
     base = dict(spec, name=name, width=w,
                 x=x + w * _ALIGN_OFFSET.get(align, 0.0))
+    counter = [0]
 
-    def attempt(size):
-        trial = dict(base, size=size, y=y + size)
-        shapes, _names = _add(doc, layer, [trial], name)
-        shape = shapes[0]
-        return shape, units.rect(shape.boundingBox())
+    def attempt(size, shape_name):
+        trial = dict(base, name=shape_name, size=size, y=y + size)
+        shapes, _names = _add(doc, layer, [trial], prefix)
+        return shapes[0], units.rect(shapes[0].boundingBox())
+
+    def trial(size):
+        counter[0] += 1
+        return attempt(size, _trial_name(prefix, counter[0], reserved))
 
     size = layout["size"]
-    shape, bounds = attempt(size)
+    _trial_shape, bounds = trial(size)
+    best_size = size
     warning = None
     if layout["fit"] and not _fits(bounds, layout["box"]):
-        shape.remove()
         lo, hi = layout["min_size"], size
-        shape, bounds = attempt(lo)
-        size = lo
+        _trial_shape, bounds = trial(lo)
+        best_size = lo
         if not _fits(bounds, layout["box"]):
             warning = ("Text {0!r} overflows its box even at min_size {1}px."
                        .format(name, lo))
@@ -198,16 +241,15 @@ def _place_in_box(doc, layer, spec, layout, name, units):
                 if hi - lo < 0.5:
                     break
                 mid = round((lo + hi) / 2.0, 2)
-                trial, trial_bounds = attempt(mid)
+                _trial_shape, trial_bounds = trial(mid)
                 if _fits(trial_bounds, layout["box"]):
-                    shape.remove()
-                    shape, bounds, size, lo = trial, trial_bounds, mid, mid
+                    best_size, lo = mid, mid
                 else:
-                    trial.remove()
                     hi = mid
     elif not _fits(bounds, layout["box"]):
         warning = "Text {0!r} overflows its box (fit is off).".format(name)
 
+    shape, bounds = attempt(best_size, name)
     if layout["valign"] == "top":
         top = y
     elif layout["valign"] == "bottom":
@@ -218,7 +260,7 @@ def _place_in_box(doc, layer, spec, layout, name, units):
     if abs(dy) >= 0.05:
         position = shape.position()
         shape.setPosition(QPointF(position.x(), position.y() + dy / units.sy))
-    return shape, size, warning
+    return shape, best_size, warning
 
 
 def _split_specs(specs):
@@ -259,38 +301,205 @@ def _plan_names(layer, layer_name, split):
     return prefix, names
 
 
-def _check_specs(doc, plain, boxed, names):
+def _check_specs(doc, plain, boxed, names, labels=None):
+    """Validate builder specs before anything is created.
+
+    ``labels`` (an index -> error prefix function) is for update_vector_shapes:
+    each spec is checked on its own so its refusal names that update. Add keeps
+    its historical combined check, and therefore its historical messages.
+    """
     try:
-        svgshapes.build_svg([s for _i, s in plain], doc.width(), doc.height())
+        if labels is None:
+            svgshapes.build_svg([s for _i, s in plain], doc.width(),
+                                doc.height())
+            for i, spec, _layout in boxed:
+                svgshapes.build_svg(
+                    [dict(spec, name=names[i], x=0, y=0, width=1)],
+                    doc.width(), doc.height())
+            return
+        for i, spec in plain:
+            _check_one_spec(doc, spec, labels(i))
         for i, spec, _layout in boxed:
-            svgshapes.build_svg([dict(spec, name=names[i], x=0, y=0, width=1)],
-                                doc.width(), doc.height())
+            _check_one_spec(
+                doc, dict(spec, name=names[i], x=0, y=0, width=1), labels(i))
     except svgshapes.ShapeSpecError as exc:
         raise _err(str(exc))
 
 
-def _apply_shapes(doc, layer, plain, boxed, names, prefix, results, warnings):
-    """Add every shape; returns the added shapes. Raises with none added."""
-    units = _Units(doc)
-    added = []
+def _check_one_spec(doc, spec, key):
     try:
-        if plain:
-            shapes, _names = _add(doc, layer, [s for _i, s in plain], prefix)
-            added.extend(shapes)
-            for (i, _spec), shape in zip(plain, shapes):
-                results[i] = _shape_entry(shape, units)
-        for i, spec, layout in boxed:
-            shape, size, warning = _place_in_box(doc, layer, spec, layout,
-                                                 names[i], units)
-            added.append(shape)
-            results[i] = dict(_shape_entry(shape, units), font_size=size)
-            if warning:
-                warnings.append(warning)
+        svgshapes.build_svg([spec], doc.width(), doc.height())
+    except svgshapes.ShapeSpecError as exc:
+        message = str(exc)
+        prefix = "shape 0: "
+        if message.startswith(prefix):
+            message = message[len(prefix):]
+        raise _err("{0}: {1}".format(key, message))
+
+
+def _ui_index(parent, node):
+    """Top-first docker position of ``node`` among ``parent``'s children."""
+    uuid = _o()._node_uuid(node)
+    for index, child in enumerate(reversed(list(parent.childNodes()))):
+        if uuid and _o()._node_uuid(child) == uuid:
+            return index
+        if not uuid and child.name() == node.name():
+            return index
+    return 0
+
+
+def _rebuild_layer(doc, layer, svg):
+    """Replace ``layer`` by a fresh vector layer holding ``svg``; return it.
+
+    Shape.remove() is unusable (F31), so a layer edit is replayed as SVG.
+    Names, types, stacking order (document order in the SVG) and bounds are
+    reproduced; the layer's uuid changes. On failure the fresh layer is
+    removed with Node.remove() and the original layer is left untouched.
+    """
+    try:
+        expected = (svgshapes.layer_shape_count(svg) if svg.strip() else 0)
+    except svgshapes.LayerSvgError as exc:
+        raise _err("Could not rebuild layer {0!r}: {1}; nothing was changed."
+                   .format(layer.name(), exc))
+    parent = _o()._parent_of(doc, layer)
+    ui_index = _ui_index(parent, layer)
+    new_layer = doc.createVectorLayer(layer.name())
+    if new_layer is None:
+        raise _err("Krita could not create a vector layer to rebuild {0!r}."
+                   .format(layer.name()))
+    try:
+        _o()._insert_node(parent, new_layer, ui_index)
+        shapes = list(new_layer.addShapesFromSvg(svg)) if expected else []
+        if len(shapes) != expected:
+            raise _err("Krita rebuilt {0} of {1} shapes of layer {2!r} from "
+                       "its own SVG; the layer was left unchanged. This is a "
+                       "Krita bug; retry the call.".format(
+                           len(shapes), expected, layer.name()))
+        new_layer.setOpacity(layer.opacity())
+        new_layer.setVisible(layer.visible())
+        new_layer.setBlendingMode(layer.blendingMode())
+        new_layer.setInheritAlpha(layer.inheritAlpha())
+        new_layer.setColorLabel(layer.colorLabel())
+        new_layer.setCollapsed(layer.collapsed())
+        # A lettering layer typically carries its outline as a layer style
+        # (set_layer_style); losing it on every text edit would be silent.
+        style = layer.layerStyleToAsl()
+        if style and not new_layer.setLayerStyleFromAsl(style):
+            raise _err("Krita refused to copy the layer style of {0!r}; the "
+                       "layer was left unchanged.".format(layer.name()))
+        new_layer.setLocked(layer.locked())
     except Exception:
-        for shape in added:
-            shape.remove()
+        _remove_layer(new_layer, "incomplete rebuild")
         raise
-    return added
+    was_active = doc.activeNode() == layer
+    layer.remove()
+    if was_active:
+        doc.setActiveNode(new_layer)
+    return new_layer
+
+
+def _translate_delta(value, key):
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise _err("{0} must be [dx, dy] in canvas pixels".format(key))
+    delta = []
+    for axis, number in enumerate(value):
+        if isinstance(number, bool):
+            raise _err("{0}[{1}] must be a number, got {2!r}".format(
+                key, axis, number))
+        try:
+            number = _o()._as_float(number, "{0}[{1}]".format(key, axis))
+        except OverflowError:
+            raise _err("{0}[{1}] must be finite".format(key, axis))
+        if not math.isfinite(number):
+            raise _err("{0}[{1}] must be finite".format(key, axis))
+        delta.append(number)
+    return tuple(delta)
+
+
+def _split_updates(updates):
+    """Validate ``updates`` and split each replacement's box layout.
+
+    Pure except for the argument coercers reached through ``_o()``: every
+    refusal happens here, before the layer is read or changed.
+    """
+    if not isinstance(updates, list) or not updates:
+        raise _err("`updates` must be a non-empty array of updates")
+    if len(updates) > MAX_UPDATES:
+        raise _err("At most {0} updates per call; got {1}. Split the call."
+                   .format(MAX_UPDATES, len(updates)))
+    split = []
+    seen = {}
+    for i, update in enumerate(updates):
+        key = "updates[{0}]".format(i)
+        if not isinstance(update, dict):
+            raise _err("{0} must be an object with name and shape or translate"
+                       .format(key))
+        unknown = sorted(str(k) for k in set(update) - set(_UPDATE_KEYS))
+        if unknown:
+            raise _err("{0}: unknown key(s) {1}; allowed keys: name, shape, "
+                       "translate".format(key, ", ".join(unknown)))
+        name = update.get("name")
+        if not isinstance(name, str) or not name:
+            raise _err("{0}.name must be a non-empty string".format(key))
+        if name in seen:
+            raise _err("{0}.name {1!r} already appears in updates[{2}]; a "
+                       "shape may be updated once per call.".format(
+                           key, name, seen[name]))
+        seen[name] = i
+        has_shape = update.get("shape") is not None
+        has_translate = update.get("translate") is not None
+        if has_shape == has_translate:
+            raise _err("{0}: give exactly one of `shape` (replace the shape) "
+                       "or `translate` ([dx, dy], move it); {1} were given."
+                       .format(key, "both" if has_shape else "neither"))
+        if has_translate:
+            split.append({"name": name, "kind": "translate", "spec": None,
+                          "layout": None,
+                          "delta": _translate_delta(update["translate"],
+                                                    key + ".translate")})
+            continue
+        spec = update["shape"]
+        if not isinstance(spec, dict):
+            raise _err("{0}.shape must be an object".format(key))
+        if "name" in spec and spec["name"] != name:
+            raise _err("{0}.shape.name is {1!r} but the update name is {2!r}; "
+                       "omit shape.name or make them equal.".format(
+                           key, spec["name"], name))
+        clean, layout = _split_box(spec, i, key=key + ".shape")
+        split.append({"name": name, "kind": "shape", "spec": clean,
+                      "layout": layout, "delta": None})
+    return split
+
+
+def _layer_shapes_by_name(layer, names, layer_name):
+    """Map each wanted name to its single shape, or refuse before any edit."""
+    by_name = {}
+    for shape in layer.shapes():
+        by_name.setdefault(shape.name(), []).append(shape)
+    missing = [n for n in names if n not in by_name]
+    if missing:
+        raise _err("No shape named {0} on {1!r}; nothing was updated. Call "
+                   "list_vector_shapes for the names.".format(
+                       ", ".join(repr(n) for n in missing), layer_name),
+                   kind="not_found")
+    duplicated = [n for n in names if len(by_name[n]) > 1]
+    if duplicated:
+        detail = ", ".join("{0!r} ({1} copies)".format(n, len(by_name[n]))
+                           for n in duplicated)
+        raise _err("Shape name(s) {0} appear more than once on {1!r}; "
+                   "update_vector_shapes needs exactly one shape per name. "
+                   "Remove the extra copies with remove_vector_shapes, then "
+                   "retry.".format(detail, layer_name), kind="ambiguous")
+    return {n: by_name[n][0] for n in names}
+
+
+def _translate_shape(shape, delta, units):
+    # Measured on 5.3.4: position()/setPosition() are in document points and
+    # translate a rotated text exactly (the linear part of the transformation
+    # is unchanged), so no SVG edit or rebuild is needed to move a shape.
+    position = shape.position()
+    shape.setPosition(QPointF(position.x() + delta[0] / units.sx,
+                              position.y() + delta[1] / units.sy))
 
 
 def op_add_vector_shapes(params):
@@ -310,19 +519,200 @@ def op_add_vector_shapes(params):
     created_layer = layer is None
     if created_layer:
         layer = _new_vector_layer(doc, layer_name)
+    before_svg = None if created_layer else layer.toSvg()
+    units = _Units(doc)
+    warnings = _font_warnings([s for s, _layout in split])
     results = [None] * len(split)
-    warnings = _font_warnings([s for s, _l in split])
+    actual = list(names)
+    fitted = {}
+    scratch = None
+    rebuilt = False
     try:
-        _apply_shapes(doc, layer, plain, boxed, names, prefix, results,
-                      warnings)
+        if plain:
+            shapes, made = _add(doc, layer, [s for _i, s in plain], prefix)
+            for (i, _spec), shape, shape_name in zip(plain, shapes, made):
+                actual[i] = shape_name
+                results[i] = _shape_entry(shape, units)
+        if boxed:
+            scratch = _new_scratch_layer(doc)
+            reserved = set(names)
+            for i, spec, layout in boxed:
+                shape, size, warning = _place_in_box(
+                    doc, scratch, spec, layout, names[i], units,
+                    "fit{0}".format(i), reserved)
+                fitted[i] = size
+                actual[i] = shape.name()
+                if warning:
+                    warnings.append(warning)
+            scratch_svg = scratch.toSvg()
+            try:
+                scratch_root = svgshapes.parse_layer_svg(scratch_svg)
+                layer_svg = layer.toSvg()
+                # An empty layer (new, or emptied) exports "".
+                root = (svgshapes.parse_layer_svg(layer_svg)
+                        if layer_svg.strip()
+                        else svgshapes.empty_root_like(scratch_svg))
+                for i, _spec, _layout in boxed:
+                    svgshapes.append_root_shapes(
+                        root, [svgshapes.root_shape_element(scratch_root,
+                                                            actual[i])])
+            except svgshapes.LayerSvgError as exc:
+                raise _err("Could not edit layer {0!r}'s SVG: {1}; the call "
+                           "was rolled back.".format(layer.name(), exc))
+            layer = _rebuild_layer(doc, layer,
+                                   svgshapes.serialize_layer_svg(root))
+            rebuilt = True
+            by_name = {s.name(): s for s in layer.shapes()}
+            for i in range(len(split)):
+                shape = by_name.get(actual[i])
+                if shape is None:
+                    raise _err("Krita's rebuilt layer {0!r} lost shape {1!r}; "
+                               "the call was rolled back.".format(
+                                   layer.name(), actual[i]))
+                entry = _shape_entry(shape, units)
+                if i in fitted:
+                    entry["font_size"] = fitted[i]
+                results[i] = entry
     except Exception:
         # All or nothing: a half-lettered page is worse than a refusal.
         if created_layer:
-            layer.remove()
+            _remove_layer(layer, "rolled-back new")
+        elif before_svg is not None:
+            try:
+                _rebuild_layer(doc, layer, before_svg)
+            except Exception as exc:
+                o._log("rollback of add_vector_shapes failed: {0}".format(exc))
         raise
+    finally:
+        if scratch is not None:
+            _remove_layer(scratch, "scratch")
     o._refresh(doc)
     result = {"layer": layer.name(), "created_layer": created_layer,
-              "shapes": results}
+              "layer_rebuilt": rebuilt, "shapes": results}
+    if warnings:
+        result["warnings"] = warnings
+    return result
+
+
+def op_update_vector_shapes(params):
+    o = _o()
+    doc = o.resolve_document(params.get("document"))
+    layer_ref = params.get("layer")
+    if layer_ref in (None, ""):
+        raise _err("`layer` is required; pass the vector layer that holds the "
+                   "shapes.")
+    layer = _vector_layer(doc, layer_ref)
+    if layer.locked():
+        raise _err("Layer {0!r} is locked; unlock it with set_layer first."
+                   .format(layer.name()))
+    plan = _split_updates(params.get("updates"))
+    names = [item["name"] for item in plan]
+    # One pass over the layer: missing and ambiguous names are both refusals,
+    # and both happen before anything is created.
+    _layer_shapes_by_name(layer, names, layer.name())
+    plain = [(i, dict(item["spec"], name=item["name"]))
+             for i, item in enumerate(plan)
+             if item["kind"] == "shape" and item["layout"] is None]
+    boxed = [(i, item["spec"], item["layout"])
+             for i, item in enumerate(plan)
+             if item["kind"] == "shape" and item["layout"] is not None]
+    _check_specs(doc, plain, boxed, names,
+                 labels=lambda i: "updates[{0}].shape".format(i))
+
+    before_svg = layer.toSvg()
+    units = _Units(doc)
+    warnings = _font_warnings([item["spec"] for item in plan
+                               if item["kind"] == "shape"])
+    results = [None] * len(plan)
+    actual = list(names)
+    fitted = {}
+    shape_indexes = [i for i, item in enumerate(plan)
+                     if item["kind"] == "shape"]
+    scratch = None
+    rebuilt = False
+    translated = []
+    try:
+        if shape_indexes:
+            scratch = _new_scratch_layer(doc)
+            reserved = set(names)
+            for i in shape_indexes:
+                item = plan[i]
+                if item["layout"] is None:
+                    shapes, made = _add(
+                        doc, scratch, [dict(item["spec"], name=item["name"])],
+                        "upd{0}".format(i))
+                    actual[i] = made[0]
+                else:
+                    shape, size, warning = _place_in_box(
+                        doc, scratch, item["spec"], item["layout"],
+                        item["name"], units, "upd{0}".format(i), reserved)
+                    actual[i] = shape.name()
+                    fitted[i] = size
+                    if warning:
+                        warnings.append(warning)
+                if actual[i] != item["name"]:
+                    raise _err(
+                        "Shape {0!r} cannot keep its name through an SVG "
+                        "rebuild: the builder would create {1!r}. Rename the "
+                        "shape in Krita first.".format(item["name"],
+                                                       actual[i]))
+            scratch_svg = scratch.toSvg()
+            try:
+                scratch_root = svgshapes.parse_layer_svg(scratch_svg)
+                root = svgshapes.parse_layer_svg(before_svg)
+                for i in shape_indexes:
+                    svgshapes.replace_root_shape(
+                        root, names[i],
+                        [svgshapes.root_shape_element(scratch_root,
+                                                      actual[i])])
+            except svgshapes.LayerSvgError as exc:
+                raise _err("Could not edit layer {0!r}'s SVG: {1}; the call "
+                           "was rolled back.".format(layer.name(), exc))
+            layer = _rebuild_layer(doc, layer,
+                                   svgshapes.serialize_layer_svg(root))
+            rebuilt = True
+        current = {s.name(): s for s in layer.shapes()}
+        for i, item in enumerate(plan):
+            if item["kind"] != "translate":
+                continue
+            shape = current.get(item["name"])
+            if shape is None:
+                raise _err("Shape {0!r} disappeared before it could be moved; "
+                           "the call was rolled back.".format(item["name"]))
+            translated.append((shape, shape.position()))
+            _translate_shape(shape, item["delta"], units)
+        for i, item in enumerate(plan):
+            shape = current.get(item["name"])
+            if shape is None:
+                raise _err("Shape {0!r} is missing after the update; the call "
+                           "was rolled back.".format(item["name"]))
+            entry = {"name": item["name"],
+                     "bounds": units.rect(shape.boundingBox()),
+                     "replaced": item["kind"] == "shape"}
+            if i in fitted:
+                entry["fitted_size"] = fitted[i]
+            results[i] = entry
+        o._refresh(doc)
+    except Exception:
+        if rebuilt:
+            try:
+                _rebuild_layer(doc, layer, before_svg)
+            except Exception as exc:
+                o._log("rollback of update_vector_shapes failed: {0}".format(
+                    exc))
+        else:
+            for shape, position in reversed(translated):
+                try:
+                    shape.setPosition(position)
+                except Exception as exc:
+                    o._log("could not restore a translated shape: {0}".format(
+                        exc))
+        raise
+    finally:
+        if scratch is not None:
+            _remove_layer(scratch, "scratch")
+    result = {"layer": layer.name(), "layer_rebuilt": rebuilt,
+              "updated": results}
     if warnings:
         result["warnings"] = warnings
     return result
@@ -360,14 +750,27 @@ def op_remove_vector_shapes(params):
                    "list_vector_shapes for the names.".format(
                        ", ".join(repr(n) for n in missing), layer.name()),
                    kind="not_found")
-    removed = 0
-    for name in dict.fromkeys(names):
-        for shape in by_name[name]:
-            shape.remove()
-            removed += 1
+    wanted = list(dict.fromkeys(names))
+    shapes_in_order = list(layer.shapes())
+    svg = layer.toSvg()
+    svg_count = svgshapes.layer_shape_count(svg)
+    if svg_count != len(shapes_in_order):
+        raise _err("Krita reports {0} shapes on layer {1!r} but exports {2} "
+                   "top-level shapes in its SVG; nothing was removed. This is "
+                   "a Krita inconsistency -- reopen the document and retry."
+                   .format(len(shapes_in_order), layer.name(), svg_count))
+    wanted_set = set(wanted)
+    indexes = [i for i, shape in enumerate(shapes_in_order)
+               if shape.name() in wanted_set]
+    try:
+        svg, removed = svgshapes.drop_layer_shapes_at(svg, indexes)
+    except svgshapes.LayerSvgError as exc:
+        raise _err("Could not edit layer {0!r}'s SVG: {1}; nothing was "
+                   "removed.".format(layer.name(), exc))
+    layer = _rebuild_layer(doc, layer, svg)
     o._refresh(doc)
     return {"layer": layer.name(), "removed": removed,
-            "remaining": len(layer.shapes())}
+            "remaining": len(layer.shapes()), "layer_rebuilt": True}
 
 
 def register(op):
@@ -375,3 +778,5 @@ def register(op):
     op("list_vector_shapes", timeout=20.0)(op_list_vector_shapes)
     op("remove_vector_shapes", timeout=60.0, mutates=True)(
         op_remove_vector_shapes)
+    op("update_vector_shapes", timeout=120.0, mutates=True)(
+        op_update_vector_shapes)
